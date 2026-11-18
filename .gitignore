@@ -1,0 +1,21 @@
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+build/
+dist/
+release/
+*.spec
+
+# Runtime user configs & sensitive proxy credentials (NEVER commit)
+app_settings.json
+cached_nodes.json
+xray_config.json
+*.tmp
+*.log
+
+# External Xray kernel binary (download from XTLS/Xray-core Releases)
+xray.exe
+xray
