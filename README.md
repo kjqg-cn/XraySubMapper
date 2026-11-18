@@ -36,7 +36,8 @@
 ## 快速开始
 
 ### 方式一：直接运行便携版 EXE（推荐）
-前往 **Releases** 页面下载单文件绿色便携版 `XraySubMapper.exe`，放入任意空目录双击即可运行（已内置运行环境，使用后自动在同级目录生成 `app_settings.json` 与 `cached_nodes.json`）。
+前往 **[Releases](https://github.com/kjqg-cn/XraySubMapper/releases)** 页面下载单文件绿色便携版 `XraySubMapper.exe`，放入任意空目录双击即可开箱即用（已内置完整 Python 运行时与 Xray 内核，首次运行后自动生成本地配置与缓存文件）。
+- *（可选）若需自定义或升级 Xray 内核版本，只需将特定版本的 `xray.exe` 放置在同级目录下，程序启动时将自动优先使用该外部内核。*
 
 ### 方式二：从源码运行
 
