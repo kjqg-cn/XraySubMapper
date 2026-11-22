@@ -1,6 +1,9 @@
+import copy
 import os
 import sys
 import threading
+import warnings
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -369,13 +372,17 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(build_app_logo_icon(active=False))
         self.setAcceptDrops(True)
 
-        self.settings: Dict[str, Any] = load_settings()
-        self.nodes: List[ProxyNode] = load_cached_nodes()
+        with warnings.catch_warnings(record=True) as cache_warnings:
+            warnings.simplefilter("always", RuntimeWarning)
+            self.settings: Dict[str, Any] = load_settings()
+            self.nodes: List[ProxyNode] = load_cached_nodes()
         self.xray_mgr = XrayManager()
         self._testing_speed = False
         self._probing_ip = False
         self._force_quit = False
         self._applied_signature: Optional[Tuple] = None
+        self._pending_signature: Optional[Tuple] = None
+        self._service_busy = False
         self._log_lines_count = 0
         self._manual_name_width: Optional[int] = None
         self._resizing_columns_internally = False
@@ -416,6 +423,11 @@ class MainWindow(QMainWindow):
         self._watchdog.setInterval(1500)
         self._watchdog.timeout.connect(self._check_xray_alive)
         self._watchdog.start()
+        if cache_warnings:
+            details = "\n".join(str(warning.message) for warning in cache_warnings)
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "缓存读取提示", details + "\n\n读取失败的原文件会保留，请先备份并恢复原账户或文件。",
+            ))
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -459,7 +471,7 @@ class MainWindow(QMainWindow):
         self.btn_reload_dirty = QPushButton(" 应用变更")
         self.btn_reload_dirty.setIcon(icon("refresh", "#B45309", 13))
         self.btn_reload_dirty.setProperty("role", "warning_pill")
-        self.btn_reload_dirty.setToolTip("节点或端口配置已变更，点击平滑重载 Xray 使新配置立即生效")
+        self.btn_reload_dirty.setToolTip("验证新配置后重启 Xray；现有连接会断开，切换失败时尝试恢复原配置")
         self.btn_reload_dirty.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reload_dirty.clicked.connect(self._reload_service)
         self.btn_reload_dirty.hide()
@@ -1008,12 +1020,15 @@ class MainWindow(QMainWindow):
             str(self.settings.get("auth_user", "")),
             str(self.settings.get("auth_pass", "")),
         )
-        enabled_items = tuple((id(n), n.local_port) for n in self.nodes if n.enabled)
+        enabled_items = tuple((id(n), n.local_port, n.connection_key()) for n in self.nodes if n.enabled)
         return (listen_ip, auth_t, enabled_items)
+
+    def _has_unapplied_changes(self) -> bool:
+        return self.xray_mgr.is_running() and self._calc_config_signature() != self._applied_signature
 
     def _sync_dirty_banner(self) -> None:
         if self.xray_mgr.is_running() and self._applied_signature is not None:
-            is_dirty = self._calc_config_signature() != self._applied_signature
+            is_dirty = self._has_unapplied_changes()
             self.btn_reload_dirty.setVisible(is_dirty)
         else:
             self.btn_reload_dirty.hide()
@@ -1164,27 +1179,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "解析订阅失败", f"未能从订阅中解析出有效节点：\n{detail}")
             return
 
+        preserve_state = url == self.settings.get("subscription_url")
         recent = [u for u in self.settings.get("recent_urls", []) if u != url]
         recent.insert(0, url)
         self.settings["recent_urls"] = recent[:12]
         self.settings["subscription_url"] = url
-        if meta:
-            self.settings["sub_userinfo"] = meta
+        self.settings["sub_userinfo"] = meta
         save_settings(self.settings)
         self.inp_url.setText(url)
 
         self._refresh_sub_userinfo_badge()
-        self._load_new_nodes(nodes, source_label=f"成功更新订阅 · 导入 {len(nodes)} 个节点")
+        self._load_new_nodes(nodes, source_label=f"成功更新订阅 · 导入 {len(nodes)} 个节点", preserve_state=preserve_state)
+        self._show_import_errors(errors)
 
     def _on_fetch_failed(self, err_msg: str) -> None:
         self.btn_fetch.setEnabled(True)
         self.btn_fetch.setText(" 下载更新")
         QMessageBox.critical(self, "下载订阅失败", f"请求订阅链接时出错：\n{err_msg}")
 
-    def _load_new_nodes(self, new_nodes: List[ProxyNode], source_label: str = "") -> None:
+    def _show_import_errors(self, errors: List[str]) -> None:
+        if errors:
+            QMessageBox.warning(self, "部分节点未导入", "\n".join(errors[:8]))
+
+    def _load_new_nodes(
+        self, new_nodes: List[ProxyNode], source_label: str = "", preserve_state: bool = False,
+    ) -> None:
+        if preserve_state:
+            previous = defaultdict(deque)
+            for node in self.nodes:
+                previous[node.connection_key()].append(node)
+            for node in new_nodes:
+                matches = previous[node.connection_key()]
+                if matches:
+                    old = matches.popleft()
+                    node.enabled = old.enabled
+                    node.local_port = old.local_port
+                    node.port_pinned = old.port_pinned
         self.nodes = new_nodes
-        self._assign_ports(reset_pinned=True)
         self.table_model.set_nodes(self.nodes)
+        self._assign_ports(reset_pinned=not preserve_state)
         self._update_summary_counters()
         if source_label:
             self._notify(source_label, "success")
@@ -1211,9 +1244,10 @@ class MainWindow(QMainWindow):
             self._notify("已粘贴订阅链接到地址栏，回车即可下载", "info")
             return
 
-        nodes, _ = parse_subscription_content(cb)
+        nodes, errors = parse_subscription_content(cb)
         if nodes:
             self._load_new_nodes(nodes, f"从剪贴板导入 {len(nodes)} 个节点")
+            self._show_import_errors(errors)
         else:
             self._open_paste_dialog()
 
@@ -1224,6 +1258,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未识别到有效节点", detail)
             return
         self._load_new_nodes(nodes, f"成功导入 {len(nodes)} 个节点")
+        self._show_import_errors(errors)
 
     def _import_from_file(self) -> None:
         fpath, _ = QFileDialog.getOpenFileName(
@@ -1237,13 +1272,17 @@ class MainWindow(QMainWindow):
 
     def _load_file_path(self, fpath: str) -> None:
         try:
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            with open(fpath, "r", encoding="utf-8-sig", errors="ignore") as f:
                 content = f.read()
-            nodes, _ = parse_subscription_content(content)
+            nodes, errors = parse_subscription_content(content)
             if not nodes:
-                self._notify("该文件中未发现有效代理节点", "error")
+                if errors:
+                    self._show_import_errors(errors)
+                else:
+                    self._notify("该文件中未发现有效代理节点", "error")
                 return
             self._load_new_nodes(nodes, f"已从 {os.path.basename(fpath)} 导入 {len(nodes)} 个节点")
+            self._show_import_errors(errors)
         except Exception as exc:
             QMessageBox.critical(self, "读取文件失败", str(exc))
 
@@ -1383,13 +1422,13 @@ class MainWindow(QMainWindow):
         node = self.nodes[src_row]
 
         menu = QMenu(self)
-        if node.enabled and node.local_port > 0:
+        if node.enabled and node.local_port > 0 and not self._service_busy and not self._has_unapplied_changes():
             url_str = self._format_node_proxy_line(node, "url")
             socks_str = self._format_node_proxy_line(node, "socks5")
             hp_str = self._format_node_proxy_line(node, "hostport")
-            menu.addAction(f"复制 HTTP 代理 ({url_str})", lambda: self._copy_text_toast(url_str, "已复制 HTTP 代理地址"))
-            menu.addAction(f"复制 SOCKS5 代理 ({socks_str})", lambda: self._copy_text_toast(socks_str, "已复制 SOCKS5 代理地址"))
-            menu.addAction(f"复制 IP:Port ({hp_str})", lambda: self._copy_text_toast(hp_str, "已复制 IP:Port"))
+            menu.addAction(f"复制 HTTP 代理 ({url_str})", lambda: self._copy_node_proxy(node, "url"))
+            menu.addAction(f"复制 SOCKS5 代理 ({socks_str})", lambda: self._copy_node_proxy(node, "socks5"))
+            menu.addAction(f"复制 IP:Port ({hp_str})", lambda: self._copy_node_proxy(node, "hostport"))
         if node.raw_link:
             menu.addAction("复制原始节点分享链接", lambda: self._copy_text_toast(node.raw_link, "已复制原始分享链接"))
 
@@ -1426,6 +1465,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Copy & Export Helpers
     # ------------------------------------------------------------------
+    def _ensure_ready_for_export(self) -> bool:
+        if self._service_busy or self._has_unapplied_changes():
+            self._notify("请等待服务操作完成并应用配置变更后，再复制或导出代理", "warning")
+            return False
+        return True
+
+    def _copy_node_proxy(self, node: ProxyNode, fmt: str) -> None:
+        if self._ensure_ready_for_export() and node in self.nodes and node.enabled:
+            self._copy_text_toast(self._format_node_proxy_line(node, fmt), "已复制代理地址")
+
     def _format_node_proxy_line(self, node: ProxyNode, fmt: str = "url") -> str:
         raw_ip = str(self.combo_listen.currentData() or "127.0.0.1")
         host_disp = "127.0.0.1" if raw_ip == "0.0.0.0" else raw_ip
@@ -1451,6 +1500,8 @@ class MainWindow(QMainWindow):
         self._notify(msg, "success")
 
     def _copy_proxies_bulk(self, fmt: str = "url", only_passed: bool = False) -> None:
+        if not self._ensure_ready_for_export():
+            return
         candidates = [n for n in self.nodes if n.enabled and n.local_port > 0]
         if only_passed:
             candidates = [n for n in candidates if n.latency_ms is not None and n.latency_ms >= 0]
@@ -1466,6 +1517,8 @@ class MainWindow(QMainWindow):
         self._notify(f"已复制 {len(lines)} 条代理地址 ({label_map.get(fmt, 'URL')})", "success")
 
     def _export_proxies_to_file(self) -> None:
+        if not self._ensure_ready_for_export():
+            return
         candidates = [n for n in self.nodes if n.enabled and n.local_port > 0]
         if not candidates:
             self._notify("当前没有已启用的节点可导出", "warning")
@@ -1473,6 +1526,9 @@ class MainWindow(QMainWindow):
         fpath, _ = QFileDialog.getSaveFileName(self, "导出代理映射列表", "proxies.txt", "文本文件 (*.txt)")
         if not fpath:
             return
+        if not self._ensure_ready_for_export():
+            return
+        candidates = [n for n in self.nodes if n.enabled and n.local_port > 0]
         try:
             lines = [self._format_node_proxy_line(n, "comment") for n in candidates]
             with open(fpath, "w", encoding="utf-8") as f:
@@ -1493,12 +1549,16 @@ class MainWindow(QMainWindow):
         return "", ""
 
     def _toggle_service(self) -> None:
+        if self._service_busy:
+            return
         if self.xray_mgr.is_running():
             self._stop_service()
         else:
             self._start_service()
 
     def _start_service(self) -> None:
+        if self._service_busy:
+            return
         active = [n for n in self.nodes if n.enabled]
         if not active:
             self._notify("请至少勾选一个需要映射的代理节点", "warning")
@@ -1507,19 +1567,25 @@ class MainWindow(QMainWindow):
         listen_ip = str(self.combo_listen.currentData() or "127.0.0.1")
         auth_u, auth_p = self._get_auth_pair()
 
-        self.btn_service.setEnabled(False)
+        self._set_service_busy(True)
         self.btn_service.setText(" 正在启动...")
         self._set_service_badge_style("starting", "● 正在启动内核...")
 
-        nodes_snapshot = list(self.nodes)
+        self._pending_signature = self._calc_config_signature()
+        nodes_snapshot = copy.deepcopy(self.nodes)
 
         def _worker() -> None:
-            ok, msg = self.xray_mgr.start(nodes_snapshot, listen_ip=listen_ip, auth_user=auth_u, auth_pass=auth_p)
+            try:
+                ok, msg = self.xray_mgr.start(nodes_snapshot, listen_ip=listen_ip, auth_user=auth_u, auth_pass=auth_p)
+            except Exception as exc:
+                ok, msg = False, str(exc)
             self.bridge.serviceTransitioned.emit(ok, msg, "start")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _reload_service(self) -> None:
+        if self._service_busy:
+            return
         active = [n for n in self.nodes if n.enabled]
         if not active:
             self._stop_service()
@@ -1528,18 +1594,24 @@ class MainWindow(QMainWindow):
         listen_ip = str(self.combo_listen.currentData() or "127.0.0.1")
         auth_u, auth_p = self._get_auth_pair()
 
-        self.btn_reload_dirty.setEnabled(False)
+        self._set_service_busy(True)
         self.btn_reload_dirty.setText(" 正在重载...")
-        nodes_snapshot = list(self.nodes)
+        self._pending_signature = self._calc_config_signature()
+        nodes_snapshot = copy.deepcopy(self.nodes)
 
         def _worker() -> None:
-            ok, msg = self.xray_mgr.reload(nodes_snapshot, listen_ip=listen_ip, auth_user=auth_u, auth_pass=auth_p)
+            try:
+                ok, msg = self.xray_mgr.reload(nodes_snapshot, listen_ip=listen_ip, auth_user=auth_u, auth_pass=auth_p)
+            except Exception as exc:
+                ok, msg = False, str(exc)
             self.bridge.serviceTransitioned.emit(ok, msg, "reload")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _stop_service(self) -> None:
-        self.btn_service.setEnabled(False)
+        if self._service_busy:
+            return
+        self._set_service_busy(True)
         self.btn_service.setText(" 正在停止...")
 
         def _worker() -> None:
@@ -1548,28 +1620,38 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _set_service_busy(self, busy: bool) -> None:
+        self._service_busy = busy
+        self.btn_service.setEnabled(not busy)
+        self.btn_reload_dirty.setEnabled(not busy)
+        if self.tray:
+            self.act_tray_toggle.setEnabled(not busy)
+
     def _on_service_transitioned(self, ok: bool, msg: str, action: str) -> None:
-        self.btn_service.setEnabled(True)
-        self.btn_reload_dirty.setEnabled(True)
+        self._set_service_busy(False)
         self.btn_reload_dirty.setText(" 应用变更")
 
         if action in ("start", "reload"):
             if ok:
-                self._applied_signature = self._calc_config_signature()
+                self._applied_signature = self._pending_signature
                 self._apply_running_ui_state(True)
                 self._sync_dirty_banner()
-                toast_txt = "新端口映射配置已平滑生效" if action == "reload" else msg
+                toast_txt = "新配置已生效（现有连接已重启）" if action == "reload" else msg
                 self._notify(toast_txt, "success")
             else:
                 self._apply_running_ui_state(self.xray_mgr.is_running())
                 if not self.xray_mgr.is_running():
+                    self._applied_signature = None
                     self._set_service_badge_style("error", "● 启动失败")
+                self._sync_dirty_banner()
                 QMessageBox.critical(self, "Xray 服务启动失败", msg)
         elif action == "stop":
-            self._applied_signature = None
-            self._apply_running_ui_state(False)
+            if ok:
+                self._applied_signature = None
+            self._apply_running_ui_state(self.xray_mgr.is_running())
             self._sync_dirty_banner()
-            self._notify("Xray 代理映射服务已停止", "info")
+            self._notify(msg, "info" if ok else "error")
+        self._pending_signature = None
 
     def _apply_running_ui_state(self, running: bool) -> None:
         app_ic = build_app_logo_icon(active=running)
@@ -1580,7 +1662,7 @@ class MainWindow(QMainWindow):
         self.lbl_logo.setPixmap(app_ic.pixmap(QSize(32, 32)))
 
         if running:
-            ports = sorted(n.local_port for n in self.nodes if n.enabled and n.local_port > 0)
+            ports = sorted(m["local_port"] for m in self.xray_mgr.active_mappings)
             p_range = f"{ports[0]}–{ports[-1]}" if len(ports) > 1 else (str(ports[0]) if ports else "")
             lan_tag = " [LAN]" if self.xray_mgr.listen_ip == "0.0.0.0" else ""
             badge = f"● 运行中 · {len(ports)} 端口 ({p_range}){lan_tag}"
@@ -1607,6 +1689,8 @@ class MainWindow(QMainWindow):
         self.btn_service.style().polish(self.btn_service)
 
     def _check_xray_alive(self) -> None:
+        if self._service_busy:
+            return
         if self._applied_signature is not None and not self.xray_mgr.is_running():
             self._applied_signature = None
             self._apply_running_ui_state(False)
@@ -1618,11 +1702,14 @@ class MainWindow(QMainWindow):
     # Latency Speedtest & Exit IP Probing
     # ------------------------------------------------------------------
     def _ensure_ready_for_probe(self) -> bool:
+        if self._service_busy:
+            self._notify("请等待服务操作完成后再进行测试", "warning")
+            return False
         if not self.xray_mgr.is_running():
             self._notify("请先点击右上角【启动映射服务】后再进行测试", "warning", 2800)
             return False
-        if self.btn_reload_dirty.isVisible():
-            self._notify("端口或节点配置已变更，正在自动重载最新映射后再测试...", "info")
+        if self._has_unapplied_changes():
+            self._notify("配置已变更，正在应用；完成后请再次点击测试", "info")
             self._reload_service()
             return False
         return True
@@ -1634,15 +1721,7 @@ class MainWindow(QMainWindow):
         if not node.enabled or node.local_port <= 0:
             self._notify("该节点未启用", "warning")
             return
-        test_url = str(self.settings.get("test_url") or "https://cp.cloudflare.com/generate_204")
-
-        def _worker() -> None:
-            ok, lat, err = self.xray_mgr.test_single_proxy(node.local_port, test_url=test_url)
-            node.latency_ms = lat if ok else -1
-            node.last_error = "" if ok else err
-            self.bridge.speedProgress.emit(1, 1, node)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self._run_speed_probe([node], single=True)
 
     def _test_all_speed_async(self) -> None:
         if self._testing_speed or not self._ensure_ready_for_probe():
@@ -1655,26 +1734,47 @@ class MainWindow(QMainWindow):
         self._testing_speed = True
         self.btn_speed.setEnabled(False)
         self.btn_speed.setText(f" 测速 0/{len(active)}")
+        self._run_speed_probe(active)
+
+    def _run_speed_probe(self, nodes: List[ProxyNode], single: bool = False) -> None:
         test_url = str(self.settings.get("test_url") or "https://cp.cloudflare.com/generate_204")
+        signature = self._calc_config_signature()
+        generation = self.xray_mgr.generation
+        snapshots = copy.deepcopy(nodes)
+        originals = {id(snapshot): node for node, snapshot in zip(nodes, snapshots)}
 
         def _worker() -> None:
-            self.xray_mgr.test_all_proxies(
-                active,
-                test_url=test_url,
-                progress_cb=lambda d, t, n: self.bridge.speedProgress.emit(d, t, n),
-            )
-            self.bridge.speedFinished.emit()
+            try:
+                self.xray_mgr.test_all_proxies(
+                    snapshots, test_url=test_url,
+                    progress_cb=lambda d, t, n: self.bridge.speedProgress.emit(
+                        d, t, (originals[id(n)], n, signature, generation)),
+                )
+            except Exception as exc:
+                self.bridge.logReceived.emit(f"测速失败: {exc}")
+            finally:
+                if not single:
+                    self.bridge.speedFinished.emit()
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_speed_progress(self, done: int, total: int, node: ProxyNode) -> None:
+    def _accept_probe_result(self, payload) -> Optional[Tuple[ProxyNode, ProxyNode]]:
+        node, snapshot, signature, generation = payload
+        if (self._service_busy or not self.xray_mgr.is_running()
+                or generation != self.xray_mgr.generation or node not in self.nodes
+                or signature != self._applied_signature or signature != self._calc_config_signature()):
+            return None
+        return node, snapshot
+
+    def _on_speed_progress(self, done: int, total: int, payload) -> None:
         if self._testing_speed:
             self.btn_speed.setText(f" 测速 {done}/{total}")
-        try:
-            row = self.nodes.index(node)
-            self.table_model.refresh_row(row)
-        except ValueError:
-            pass
+        accepted = self._accept_probe_result(payload)
+        if accepted is None:
+            return
+        node, snapshot = accepted
+        node.latency_ms, node.last_error = snapshot.latency_ms, snapshot.last_error
+        self.table_model.refresh_row(self.nodes.index(node))
         if total == 1 and not self._testing_speed:
             self._persist_nodes()
             if node.latency_ms and node.latency_ms >= 0:
@@ -1699,12 +1799,7 @@ class MainWindow(QMainWindow):
             self._notify("该节点未启用", "warning")
             return
 
-        def _worker() -> None:
-            ok, ip_info = self.xray_mgr.probe_exit_ip(node.local_port)
-            node.exit_ip = ip_info if ok else ""
-            self.bridge.exitIpProgress.emit(1, 1, node)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self._run_exit_ip_probe([node], single=True)
 
     def _probe_all_exit_ips_async(self) -> None:
         if self._probing_ip or not self._ensure_ready_for_probe():
@@ -1716,24 +1811,38 @@ class MainWindow(QMainWindow):
         self._probing_ip = True
         self.btn_probe_ip.setEnabled(False)
         self.btn_probe_ip.setText(f" 探测 0/{len(active)}")
+        self._run_exit_ip_probe(active)
+
+    def _run_exit_ip_probe(self, nodes: List[ProxyNode], single: bool = False) -> None:
+        signature = self._calc_config_signature()
+        generation = self.xray_mgr.generation
+        snapshots = copy.deepcopy(nodes)
+        originals = {id(snapshot): node for node, snapshot in zip(nodes, snapshots)}
 
         def _worker() -> None:
-            self.xray_mgr.probe_all_exit_ips(
-                active,
-                progress_cb=lambda d, t, n: self.bridge.exitIpProgress.emit(d, t, n),
-            )
-            self.bridge.exitIpFinished.emit()
+            try:
+                self.xray_mgr.probe_all_exit_ips(
+                    snapshots,
+                    progress_cb=lambda d, t, n: self.bridge.exitIpProgress.emit(
+                        d, t, (originals[id(n)], n, signature, generation)),
+                )
+            except Exception as exc:
+                self.bridge.logReceived.emit(f"出口探测失败: {exc}")
+            finally:
+                if not single:
+                    self.bridge.exitIpFinished.emit()
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_exit_ip_progress(self, done: int, total: int, node: ProxyNode) -> None:
+    def _on_exit_ip_progress(self, done: int, total: int, payload) -> None:
         if self._probing_ip:
             self.btn_probe_ip.setText(f" 探测 {done}/{total}")
-        try:
-            row = self.nodes.index(node)
-            self.table_model.refresh_row(row)
-        except ValueError:
-            pass
+        accepted = self._accept_probe_result(payload)
+        if accepted is None:
+            return
+        node, snapshot = accepted
+        node.exit_ip = snapshot.exit_ip
+        self.table_model.refresh_row(self.nodes.index(node))
         if total == 1 and not self._probing_ip:
             self._persist_nodes()
             if node.exit_ip:

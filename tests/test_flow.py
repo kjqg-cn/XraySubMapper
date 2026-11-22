@@ -6,6 +6,8 @@ import socket
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.parser import parse_node_link
@@ -25,7 +27,7 @@ proxies:
     tls: true
     servername: sni.example.com
     client-fingerprint: chrome
-    skip-cert-verify: true
+    skip-cert-verify: false
     network: ws
     ws-opts:
       path: /vless-ws
@@ -53,7 +55,7 @@ proxies:
     assert vless_ws["streamSettings"]["wsSettings"]["path"] == "/vless-ws"
     assert vless_ws["streamSettings"]["wsSettings"]["host"] == "ws.example.com"
     assert "headers" not in vless_ws["streamSettings"]["wsSettings"]
-    assert vless_ws["streamSettings"]["tlsSettings"]["allowInsecure"] is True
+    assert "allowInsecure" not in vless_ws["streamSettings"]["tlsSettings"]
 
     trojan_grpc = c_nodes[1].to_outbound("t1")
     assert trojan_grpc["streamSettings"]["grpcSettings"]["serviceName"] == "trojan-grpc-svc"
@@ -96,7 +98,7 @@ proxies:
     print("[+] 协议边界用例与 Userinfo 解析全部通过！")
 
     print("[*] 3. 测试端口重复冲突拦截与 Xray stdin 无落盘启动...")
-    mgr = XrayManager()
+    mgr = XrayManager(os.environ.get("XRAY_TEST_EXECUTABLE"))
     nodes[0].local_port = 19810
     nodes[1].local_port = 19810
     nodes[2].local_port = 19812
@@ -105,8 +107,7 @@ proxies:
 
     has_xray = os.path.isfile(mgr.xray_path) or (shutil.which(mgr.xray_path) is not None)
     if not has_xray:
-        print("[*] 未在当前目录或 PATH 检测到 xray.exe，跳过内核进程监听测试（纯逻辑单测已全部通过）！")
-        return
+        pytest.skip("Xray kernel not installed; set XRAY_TEST_EXECUTABLE to run integration tests")
 
     for i, n in enumerate(nodes):
         n.local_port = 19810 + i

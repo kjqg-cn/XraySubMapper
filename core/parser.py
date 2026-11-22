@@ -60,19 +60,24 @@ def safe_b64decode(s: str) -> str:
 
 def _split_host_port(host_port: str, default_port: int = 443) -> Tuple[str, int]:
     """Safely split host:port including bracketed IPv6 like [2001:db8::1]:8388."""
-    hp = host_port.strip()
-    if hp.startswith("["):
-        end_bracket = hp.find("]")
-        if end_bracket != -1:
-            host = hp[1:end_bracket]
-            rest = hp[end_bracket + 1 :]
-            if rest.startswith(":"):
-                return host, _safe_int(rest[1:], default_port)
-            return host, default_port
-    if ":" in hp:
-        host, port_str = hp.rsplit(":", 1)
-        return host.strip("[]"), _safe_int(port_str, default_port)
-    return hp.strip("[]"), default_port
+    parsed = urlparse("//" + host_port.strip())
+    if not parsed.hostname or parsed.path not in ("", "/"):
+        raise ValueError("Invalid proxy host/port")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("Missing proxy port")
+    port = parsed.port if parsed.port is not None else default_port
+    if not 1 <= port <= 65535:
+        raise ValueError("Proxy port must be in 1..65535")
+    return parsed.hostname, port
+
+
+def _validate_transport(network: str, allow_insecure: bool = False) -> None:
+    if allow_insecure:
+        raise ValueError("Xray 26.11.9+ 不支持 allowInsecure / skip-cert-verify；请使用有效证书的节点")
+    if network in ("h2", "http", "quic"):
+        raise ValueError(f"Xray 已移除 {network} 传输，请向服务端获取 XHTTP 节点配置")
+    if network not in ("tcp", "raw", "ws", "websocket", "grpc", "xhttp", "splithttp", "httpupgrade"):
+        raise ValueError(f"不支持的传输方式: {network}")
 
 
 def _apply_transport_settings(
@@ -85,6 +90,7 @@ def _apply_transport_settings(
 ) -> None:
     """Populate Xray 26.x compatible streamSettings transport fields."""
     net = (network or "tcp").lower()
+    _validate_transport(net)
     if net in ("splithttp", "xhttp"):
         stream["network"] = "xhttp"
         xhttp_settings: Dict[str, Any] = {"path": path or "/"}
@@ -99,7 +105,7 @@ def _apply_transport_settings(
         if host:
             hu_settings["host"] = host
         stream["httpupgradeSettings"] = hu_settings
-    elif net == "ws":
+    elif net in ("ws", "websocket"):
         stream["network"] = "ws"
         ws_settings: Dict[str, Any] = {}
         if path:
@@ -114,12 +120,6 @@ def _apply_transport_settings(
         if mode == "multi":
             grpc_settings["multiMode"] = True
         stream["grpcSettings"] = grpc_settings
-    elif net in ("h2", "http"):
-        stream["network"] = "http"
-        http_settings: Dict[str, Any] = {"path": path or "/"}
-        if host:
-            http_settings["host"] = [h.strip() for h in host.split(",") if h.strip()]
-        stream["httpSettings"] = http_settings
     else:
         stream["network"] = "tcp"
         if header_type == "http":
@@ -149,8 +149,7 @@ def _build_tls_settings(
         alpn_list = [x.strip() for x in alpn.split(",") if x.strip()]
         if alpn_list:
             tls_settings["alpn"] = alpn_list
-    if allow_insecure:
-        tls_settings["allowInsecure"] = True
+    _validate_transport("tcp", allow_insecure)
     return tls_settings
 
 
@@ -174,6 +173,10 @@ class ProxyNode:
 
     def to_outbound(self, tag: str) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def connection_key(self) -> str:
+        """Stable identity excluding display name, port assignment and probe results."""
+        return json.dumps(self.to_outbound("node"), sort_keys=True, ensure_ascii=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -226,6 +229,7 @@ class VMessNode(ProxyNode):
         self.fp = fp or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
+        _validate_transport(self.network, self.allow_insecure)
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -333,6 +337,7 @@ class VLESSNode(ProxyNode):
         self.spx = spx or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
+        _validate_transport(self.network, self.allow_insecure)
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -448,6 +453,7 @@ class TrojanNode(ProxyNode):
         self.spx = spx or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
+        _validate_transport(self.network, self.allow_insecure)
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -734,15 +740,15 @@ def parse_vless(link: str) -> VLESSNode:
         encryption=get_p("encryption", "none"),
         network=net,
         header_type=get_p("headerType", "none"),
-        host=unquote(get_p("host")),
-        path=unquote(raw_path),
+        host=get_p("host"),
+        path=raw_path,
         security=get_p("security", "none"),
         sni=get_p("sni") or get_p("peer"),
-        alpn=unquote(get_p("alpn")),
+        alpn=get_p("alpn"),
         fp=get_p("fp"),
         pbk=get_p("pbk"),
         sid=get_p("sid"),
-        spx=unquote(get_p("spx")),
+        spx=get_p("spx"),
         allow_insecure=_safe_bool(get_p("allowInsecure") or get_p("insecure")),
         mode=get_p("mode"),
         raw_link=link,
@@ -772,13 +778,13 @@ def parse_trojan(link: str) -> TrojanNode:
         header_type=get_p("headerType", "none"),
         security=get_p("security", "tls"),
         sni=get_p("sni") or get_p("peer"),
-        alpn=unquote(get_p("alpn")),
+        alpn=get_p("alpn"),
         fp=get_p("fp"),
-        host=unquote(get_p("host")),
-        path=unquote(raw_path),
+        host=get_p("host"),
+        path=raw_path,
         pbk=get_p("pbk"),
         sid=get_p("sid"),
-        spx=unquote(get_p("spx")),
+        spx=get_p("spx"),
         allow_insecure=_safe_bool(get_p("allowInsecure") or get_p("insecure")),
         mode=get_p("mode"),
         raw_link=link,
@@ -795,7 +801,9 @@ def parse_ss(link: str) -> ShadowsocksNode:
 
     body = main_part[5:].strip()
     if "?" in body:
-        body = body.split("?", 1)[0]
+        body, query = body.split("?", 1)
+        if "plugin" in parse_qs(query, keep_blank_values=True):
+            raise ValueError("不支持 Shadowsocks 插件节点 (plugin)")
 
     if "@" in body:
         user_info, host_port = body.rsplit("@", 1)
@@ -905,6 +913,7 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
     host = ""
     path = ""
     header_type = "none"
+    mode = ""
 
     ws_opts = p.get("ws-opts") or p.get("ws-path")
     if isinstance(ws_opts, dict):
@@ -916,6 +925,15 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
     grpc_opts = p.get("grpc-opts")
     if isinstance(grpc_opts, dict):
         path = str(grpc_opts.get("grpc-service-name") or path)
+
+    xhttp_opts = p.get("xhttp-opts")
+    if isinstance(xhttp_opts, dict) and network in ("xhttp", "splithttp"):
+        unsupported = set(xhttp_opts) - {"path", "host", "mode"}
+        if unsupported:
+            raise ValueError(f"不支持的 XHTTP 参数: {', '.join(sorted(unsupported))}")
+        path = str(xhttp_opts.get("path") or "/")
+        host = str(xhttp_opts.get("host") or "")
+        mode = str(xhttp_opts.get("mode") or "")
 
     h2_opts = p.get("h2-opts")
     if isinstance(h2_opts, dict):
@@ -946,7 +964,7 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
     else:
         alpn = str(raw_alpn or "")
 
-    allow_insecure = bool(p.get("skip-cert-verify", False))
+    allow_insecure = _safe_bool(p.get("skip-cert-verify", False))
 
     reality_opts = p.get("reality-opts")
     pbk = ""
@@ -959,6 +977,7 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
         "network": network,
         "host": host,
         "path": path,
+        "mode": mode,
         "header_type": header_type,
         "sni": sni,
         "fp": fp,
@@ -994,6 +1013,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             alpn=tr["alpn"],
             fp=tr["fp"],
             allow_insecure=tr["allow_insecure"],
+            mode=tr["mode"],
         )
     if ptype == "vless":
         security = "reality" if tr["has_reality"] else ("tls" if p.get("tls") else "none")
@@ -1014,6 +1034,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             pbk=tr["pbk"],
             sid=tr["sid"],
             allow_insecure=tr["allow_insecure"],
+            mode=tr["mode"],
         )
     if ptype == "trojan":
         security = "reality" if tr["has_reality"] else ("tls" if p.get("tls", True) else "none")
@@ -1033,8 +1054,11 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             pbk=tr["pbk"],
             sid=tr["sid"],
             allow_insecure=tr["allow_insecure"],
+            mode=tr["mode"],
         )
     if ptype in ("ss", "shadowsocks"):
+        if p.get("plugin") or p.get("plugin-opts"):
+            raise ValueError("不支持 Shadowsocks 插件节点 (plugin / plugin-opts)")
         return ShadowsocksNode(
             name=name,
             server=server,

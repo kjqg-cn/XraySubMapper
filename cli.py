@@ -21,7 +21,7 @@ def run_cli(args: argparse.Namespace) -> None:
     elif args.file:
         print(f"[*] 正在读取文件: {args.file}")
         try:
-            with open(args.file, "r", encoding="utf-8", errors="ignore") as f:
+            with open(args.file, "r", encoding="utf-8-sig", errors="ignore") as f:
                 content = f.read()
             print("[+] 文件读取成功！")
         except Exception as e:
@@ -87,8 +87,7 @@ def run_cli(args: argparse.Namespace) -> None:
                 passed.append(node)
         print("-" * 60)
         print(f"[*] 测速完成: {len(passed)}/{len(active_nodes)} 个节点可用。\n")
-        if passed:
-            export_candidates = passed
+        export_candidates = passed
 
     if args.export:
         try:

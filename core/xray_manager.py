@@ -1,7 +1,9 @@
 import atexit
+import copy
 import ctypes
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -110,6 +112,11 @@ class XrayManager:
         self.active_mappings: List[Dict[str, Any]] = []
         self.listen_ip: str = "127.0.0.1"
         self.auth_credentials: Optional[Tuple[str, str]] = None
+        self._lifecycle_lock = threading.RLock()
+        self._stop_requested = threading.Event()
+        self._active_nodes: List[ProxyNode] = []
+        self._active_config: Optional[Dict[str, Any]] = None
+        self.generation = 0
         atexit.register(self.stop)
 
     def _find_xray_executable(self) -> str:
@@ -169,7 +176,9 @@ class XrayManager:
                 return True
 
     @staticmethod
-    def validate_node_ports(nodes: List[ProxyNode], listen_ip: str = "127.0.0.1") -> Tuple[bool, str]:
+    def validate_node_ports(
+        nodes: List[ProxyNode], listen_ip: str = "127.0.0.1", owned_ports: Optional[set] = None,
+    ) -> Tuple[bool, str]:
         """Validate port range, internal duplicates, and external port conflicts."""
         active_nodes = [n for n in nodes if n.enabled]
         if not active_nodes:
@@ -189,6 +198,8 @@ class XrayManager:
 
         conflict_ports = []
         for n in active_nodes:
+            if owned_ports and n.local_port in owned_ports:
+                continue
             if XrayManager.check_port_in_use(n.local_port, listen_ip):
                 conflict_ports.append(f"{n.local_port} ({n.name})")
 
@@ -210,7 +221,6 @@ class XrayManager:
         inbounds = []
         outbounds = []
         routing_rules = []
-        mappings = []
 
         use_auth = bool(auth_user and auth_pass)
 
@@ -238,7 +248,10 @@ class XrayManager:
             }
             inbounds.append(inbound)
 
-            outbound = node.to_outbound(out_tag)
+            try:
+                outbound = node.to_outbound(out_tag)
+            except Exception as exc:
+                raise ValueError(f"节点 [{node.name}] 配置无效: {exc}") from exc
             outbounds.append(outbound)
 
             routing_rules.append(
@@ -249,22 +262,9 @@ class XrayManager:
                 }
             )
 
-            mappings.append(
-                {
-                    "name": node.name,
-                    "protocol": node.protocol,
-                    "server": node.server,
-                    "target_port": node.port,
-                    "local_port": node.local_port,
-                    "in_tag": in_tag,
-                    "out_tag": out_tag,
-                }
-            )
-
         outbounds.append({"tag": "direct", "protocol": "freedom"})
         outbounds.append({"tag": "block", "protocol": "blackhole"})
 
-        self.active_mappings = mappings
         return {
             "log": {"loglevel": "warning"},
             "inbounds": inbounds,
@@ -284,6 +284,15 @@ class XrayManager:
         payload = json.dumps(config, ensure_ascii=False)
 
         try:
+            version = subprocess.run(
+                [self.xray_path, "version"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=10, creationflags=creationflags,
+            )
+            match = re.search(r"Xray (\d+)\.(\d+)\.(\d+)", version.stdout)
+            if version.returncode != 0 or not match:
+                return False, "无法识别 Xray 版本，请使用官方 Xray 26.11.9 或更高版本"
+            if tuple(int(v) for v in match.groups()) < (26, 11, 9):
+                return False, "需要 Xray 26.11.9 或更高版本，请升级内核"
             proc = subprocess.run(
                 [self.xray_path, "run", "-test", "-c", "stdin:"],
                 input=payload,
@@ -309,22 +318,41 @@ class XrayManager:
         auth_pass: str = "",
     ) -> Tuple[bool, str]:
         """Start Xray process mapping enabled nodes to local HTTP ports."""
-        if self.is_running():
-            return False, "代理服务已在运行中。"
+        with self._lifecycle_lock:
+            if self.is_running():
+                return False, "代理服务已在运行中。"
+            self._stop_requested.clear()
+            active_nodes = copy.deepcopy([n for n in nodes if n.enabled])
+            ok, msg, config = self._prepare_config(active_nodes, listen_ip, auth_user, auth_pass)
+            if not ok:
+                return False, msg
+            return self._launch(config, active_nodes, listen_ip, auth_user, auth_pass)
 
-        active_nodes = [n for n in nodes if n.enabled]
-        ok, err = self.validate_node_ports(active_nodes, listen_ip)
+    def _prepare_config(
+        self, nodes: List[ProxyNode], listen_ip: str, auth_user: str, auth_pass: str,
+        owned_ports: Optional[set] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports)
         if not ok:
-            return False, err
-
-        config = self.generate_config(active_nodes, listen_ip, auth_user=auth_user, auth_pass=auth_pass)
+            return False, err, {}
+        try:
+            config = self.generate_config(nodes, listen_ip, auth_user=auth_user, auth_pass=auth_pass)
+        except Exception as exc:
+            return False, str(exc), {}
         ok, msg = self.validate_config(config)
         if not ok:
-            return False, f"Xray 配置校验未通过:\n{msg}"
+            return False, f"Xray 配置校验未通过:\n{msg}", {}
+        return True, "OK", config
 
+    def _launch(
+        self, config: Dict[str, Any], active_nodes: List[ProxyNode],
+        listen_ip: str, auth_user: str, auth_pass: str,
+    ) -> Tuple[bool, str]:
+        if self._stop_requested.is_set():
+            return False, "启动已取消"
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         payload = json.dumps(config, ensure_ascii=False)
-
+        proc = None
         try:
             proc = subprocess.Popen(
                 [self.xray_path, "run", "-c", "stdin:"],
@@ -338,15 +366,8 @@ class XrayManager:
                 creationflags=creationflags,
             )
             _assign_process_to_job(self._job_handle, proc)
-
-            if proc.stdin:
-                proc.stdin.write(payload)
-                proc.stdin.close()
-
             self.process = proc
             self._running = True
-            self.listen_ip = listen_ip
-            self.auth_credentials = (auth_user, auth_pass) if (auth_user and auth_pass) else None
 
             def _reader(target_proc: subprocess.Popen) -> None:
                 stream = target_proc.stdout
@@ -355,28 +376,44 @@ class XrayManager:
                         for line in stream:
                             if line:
                                 self._log(line.rstrip())
-                            if not self._running:
-                                break
-                    except Exception:
+                    except (OSError, ValueError):
                         pass
-                if self.process is target_proc:
-                    self._running = False
+                    finally:
+                        stream.close()
                 self._log("Xray 进程已退出。")
 
             self._log_thread = threading.Thread(target=_reader, args=(proc,), daemon=True)
             self._log_thread.start()
 
+            if proc.stdin:
+                proc.stdin.write(payload)
+                proc.stdin.close()
+
             time.sleep(0.25)
             if proc.poll() is not None:
-                self._running = False
-                self.process = None
+                self._stop_process()
                 return False, f"Xray 启动后立即异常退出 (code={proc.returncode})"
+            if self._stop_requested.is_set():
+                self._stop_process()
+                return False, "启动已取消"
+
+            self.listen_ip = listen_ip
+            self.auth_credentials = (auth_user, auth_pass) if (auth_user and auth_pass) else None
+            self._active_nodes = copy.deepcopy(active_nodes)
+            self._active_config = copy.deepcopy(config)
+            self.active_mappings = [
+                {"name": n.name, "protocol": n.protocol, "server": n.server,
+                 "target_port": n.port, "local_port": n.local_port,
+                 "in_tag": f"mixed-in-{i}", "out_tag": f"node-out-{i}"}
+                for i, n in enumerate(active_nodes)
+            ]
+            self.generation += 1
 
             self._log(f"Xray 已启动 · 监听 {listen_ip} · 映射 {len(active_nodes)} 个混合端口 (HTTP + SOCKS5)")
             return True, f"已启动并映射 {len(active_nodes)} 个本地端口 (同端口支持 HTTP 与 SOCKS5)"
         except Exception as e:
-            self._running = False
-            self.process = None
+            if proc is not None:
+                self._stop_process()
             return False, f"启动 Xray 进程异常: {e}"
 
     def reload(
@@ -386,17 +423,43 @@ class XrayManager:
         auth_user: str = "",
         auth_pass: str = "",
     ) -> Tuple[bool, str]:
-        """Gracefully stop current Xray instance (if running) and start with updated configuration."""
-        if self.is_running():
-            self.stop()
-            time.sleep(0.1)
-        return self.start(nodes, listen_ip=listen_ip, auth_user=auth_user, auth_pass=auth_pass)
+        """Validate first, restart, and restore the previous service if switching fails."""
+        with self._lifecycle_lock:
+            self._stop_requested.clear()
+            active_nodes = copy.deepcopy([n for n in nodes if n.enabled])
+            was_running = self.is_running()
+            owned_ports = set()
+            if was_running and (listen_ip == self.listen_ip or "0.0.0.0" in (listen_ip, self.listen_ip)):
+                owned_ports = {n.local_port for n in self._active_nodes}
+            ok, msg, config = self._prepare_config(active_nodes, listen_ip, auth_user, auth_pass, owned_ports)
+            if not ok:
+                return False, msg
+            if self._stop_requested.is_set():
+                return False, "重载已取消"
+
+            previous = (self._active_config, self._active_nodes, self.listen_ip, self.auth_credentials)
+            if was_running:
+                ok, msg = self._stop_process()
+                if not ok:
+                    return False, msg
+            ok, msg = self._launch(config, active_nodes, listen_ip, auth_user, auth_pass)
+            if ok or not was_running or self._stop_requested.is_set():
+                return ok, msg
+            old_config, old_nodes, old_ip, old_auth = previous
+            restored, restore_msg = self._launch(old_config, old_nodes, old_ip, *(old_auth or ("", "")))
+            if restored:
+                return False, f"重载失败，已恢复原配置：\n{msg}"
+            return False, f"重载失败：{msg}\n恢复原配置也失败：{restore_msg}"
 
     def stop(self) -> Tuple[bool, str]:
         """Stop Xray process cleanly."""
+        self._stop_requested.set()
+        with self._lifecycle_lock:
+            return self._stop_process()
+
+    def _stop_process(self) -> Tuple[bool, str]:
         self._running = False
         proc = self.process
-        self.process = None
         if not proc:
             return True, "服务未运行"
 
@@ -408,6 +471,11 @@ class XrayManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=1.0)
+            self.process = None
+            self.active_mappings = []
+            self._active_config = None
+            self._active_nodes = []
+            self.generation += 1
             self._log("Xray 服务已停止。")
             return True, "代理服务已停止"
         except Exception as e:
@@ -415,12 +483,7 @@ class XrayManager:
 
     def is_running(self) -> bool:
         proc = self.process
-        if proc is not None:
-            if proc.poll() is None:
-                return True
-            self._running = False
-            self.process = None
-        return False
+        return proc is not None and proc.poll() is None
 
     def _build_proxy_url(self, local_port: int, host: Optional[str] = None) -> str:
         target_host = host or self.listen_ip or "127.0.0.1"
@@ -438,9 +501,10 @@ class XrayManager:
         timeout: float = 5.0,
         host: Optional[str] = None,
         session: Optional[requests.Session] = None,
+        proxy_url: Optional[str] = None,
     ) -> Tuple[bool, Optional[int], str]:
         """Test a local HTTP proxy port over HTTPS CONNECT tunnel."""
-        proxy_url = self._build_proxy_url(local_port, host=host)
+        proxy_url = proxy_url or self._build_proxy_url(local_port, host=host)
         proxies = {"http": proxy_url, "https": proxy_url}
         start_t = time.perf_counter()
 
@@ -478,7 +542,9 @@ class XrayManager:
     ) -> Dict[int, Tuple[bool, Optional[int], str]]:
         """Concurrently test latency for all enabled nodes."""
         results: Dict[int, Tuple[bool, Optional[int], str]] = {}
-        active_nodes = [n for n in nodes if n.enabled and n.local_port > 0]
+        generation = self.generation
+        active_nodes = [(n, n.local_port, n.connection_key(), self._build_proxy_url(n.local_port))
+                        for n in nodes if n.enabled and n.local_port > 0]
         total = len(active_nodes)
         if total == 0:
             return results
@@ -486,14 +552,18 @@ class XrayManager:
         lock = threading.Lock()
         done_counter = [0]
 
-        def _worker(node: ProxyNode) -> None:
-            ok, lat, msg = self.test_single_proxy(node.local_port, test_url=test_url, timeout=timeout)
-            node.latency_ms = lat if ok else -1
-            node.last_error = "" if ok else msg
+        def _worker(item) -> None:
+            node, port, key, proxy_url = item
+            ok, lat, msg = self.test_single_proxy(port, test_url=test_url, timeout=timeout, proxy_url=proxy_url)
+            current = (generation == self.generation and node.enabled
+                       and node.local_port == port and node.connection_key() == key)
+            if current:
+                node.latency_ms = lat if ok else -1
+                node.last_error = "" if ok else msg
             with lock:
                 done_counter[0] += 1
                 done_now = done_counter[0]
-                results[node.local_port] = (ok, lat, msg)
+                results[port] = (ok, lat, msg)
             if progress_cb:
                 progress_cb(done_now, total, node)
 
@@ -502,9 +572,11 @@ class XrayManager:
 
         return results
 
-    def probe_exit_ip(self, local_port: int, timeout: float = 6.0) -> Tuple[bool, str]:
+    def probe_exit_ip(
+        self, local_port: int, timeout: float = 6.0, proxy_url: Optional[str] = None,
+    ) -> Tuple[bool, str]:
         """Query outbound exit IP and country code through the mapped local HTTP proxy."""
-        proxy_url = self._build_proxy_url(local_port)
+        proxy_url = proxy_url or self._build_proxy_url(local_port)
         proxies = {"http": proxy_url, "https": proxy_url}
         with requests.Session() as sess:
             sess.trust_env = False
@@ -541,7 +613,9 @@ class XrayManager:
         nodes: List[ProxyNode],
         progress_cb: Optional[Callable[[int, int, ProxyNode], None]] = None,
     ) -> None:
-        active_nodes = [n for n in nodes if n.enabled and n.local_port > 0]
+        generation = self.generation
+        active_nodes = [(n, n.local_port, n.connection_key(), self._build_proxy_url(n.local_port))
+                        for n in nodes if n.enabled and n.local_port > 0]
         total = len(active_nodes)
         if total == 0:
             return
@@ -549,9 +623,12 @@ class XrayManager:
         lock = threading.Lock()
         done_counter = [0]
 
-        def _worker(node: ProxyNode) -> None:
-            ok, ip_info = self.probe_exit_ip(node.local_port)
-            node.exit_ip = ip_info if ok else ""
+        def _worker(item) -> None:
+            node, port, key, proxy_url = item
+            ok, ip_info = self.probe_exit_ip(port, proxy_url=proxy_url)
+            if (generation == self.generation and node.enabled
+                    and node.local_port == port and node.connection_key() == key):
+                node.exit_ip = ip_info if ok else ""
             with lock:
                 done_counter[0] += 1
                 done_now = done_counter[0]

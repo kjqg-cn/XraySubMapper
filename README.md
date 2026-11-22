@@ -26,10 +26,20 @@
 - **并发真连接测速与落地出口探测**：
   - 基于 HTTPS `CONNECT` 隧道并发测量各本地端口的真实往返延迟，支持按延迟一键升序排列与“仅保留测速可用节点”。
   - 支持一键并发探测各端口的真实落地出口公网 IP 与国家代码，防止多实例业务串线。
-- **零落盘安全架构与防孤儿进程**：
+- **内存内核配置、加密缓存与防孤儿进程**：
   - 通过内存 `stdin` 管道向 Xray 内核注入配置与校验，**不在磁盘落盘明文节点密钥配置文件**。
+  - 节点缓存、订阅链接和本地鉴权设置使用 Windows 当前账户的 DPAPI 加密，旧版明文缓存首次读取时自动迁移；加密失败时不会回退为明文保存。缓存通常只能由原电脑上的原 Windows 账户解密，复制便携程序到其他账户或电脑时需要重新导入订阅。该保护不防御已取得当前账户权限的进程。
+  - 缓存损坏或无法解密时会显示启动提示，并阻止自动保存覆盖读取失败的原文件。请先备份并恢复原账户或缓存文件；跨电脑使用时仅复制程序，不携带原账户的缓存。
   - 绑定 Windows Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`），宿主异常崩溃或被强行终止时由系统内核自动回收 `xray.exe` 子进程，杜绝后台残留占用端口。
-- **双模式运行**：同时提供基于 `PySide6` 的现代桌面工作台（支持配置变更一键平滑热重载、系统托盘驻留、拖拽/快捷键导入）与无界面 `CLI` 命令行模式。
+- **双模式运行**：同时提供基于 `PySide6` 的现代桌面工作台（支持验证新配置后重启应用、系统托盘驻留、拖拽/快捷键导入）与无界面 `CLI` 命令行模式。应用配置会断开现有连接；预检失败时保留旧服务，切换失败时尝试恢复旧配置。
+
+### 兼容范围与导入提示
+
+- 内核要求为官方 **Xray 26.11.9 或更高版本**，启动时自动检查版本。已验证的传输为 TCP/RAW、WebSocket、gRPC、XHTTP 和 HTTPUpgrade。
+- `allowInsecure` / `skip-cert-verify: true`、旧 H2/HTTP/QUIC transport、未实现的传输及 Shadowsocks 插件节点会报告导入错误，不会静默改成其他协议或降低证书校验。请向节点提供方获取受支持的配置。
+- Clash XHTTP 支持 `xhttp-opts.path`、`host`、`mode`；其他 XHTTP 选项会明确报告尚不支持。
+- 更新同一订阅时按连接配置匹配节点，保留端口锁定和启停选择；手动替换导入会重新编排端口。
+- 服务运行时，节点、端口、监听地址或鉴权有待应用变更，会拦截代理复制和导出，避免导出与实际出口不符的地址。服务停止时可导出计划映射。
 
 ---
 
@@ -48,7 +58,7 @@
    pip install -r requirements.txt
    ```
 2. **放置 Xray 内核**：
-   从官方 [XTLS/Xray-core Releases](https://github.com/XTLS/Xray-core/releases) 下载对应平台的 `Xray-windows-64.zip`，解压出 **`xray.exe`** 放置在项目根目录下（或加入系统 `PATH`）。
+   从官方 [XTLS/Xray-core Releases](https://github.com/XTLS/Xray-core/releases) 下载 **26.11.9 或更高版本**对应平台的 `Xray-windows-64.zip`，解压出 **`xray.exe`** 放置在项目根目录下（或加入系统 `PATH`）。
 3. **启动桌面界面**：
    - 双击 `启动工具(免黑框).vbs`（无控制台窗口）或 `启动工具.bat`；
    - 或在终端执行：
@@ -118,14 +128,21 @@ XraySubMapper/
 │   ├── parser.py            # 多协议链接与 Clash YAML 解析器
 │   ├── subscription.py      # 订阅拉取、编码识别与流量元数据提取
 │   ├── xray_manager.py      # Xray 内存管道启停、Job 守护、并发测速与出口探测
-│   └── config.py            # 原子化配置与节点缓存持久化
+│   └── config.py            # DPAPI 加密配置与节点缓存持久化
 ├── gui/
 │   ├── app.py               # PySide6 主窗口、热重载与托盘管理
 │   ├── widgets.py           # Model/FilterProxy、抗锯齿自绘委托与悬浮 Toast
 │   └── icons.py             # 多分辨率矢量 SVG 图标渲染器
 └── tests/
-    └── test_flow.py         # 协议解析与进程生命周期集成测试
+    ├── test_flow.py         # 协议解析与进程生命周期集成测试
+    ├── test_parser.py       # 协议参数与编码边界回归
+    ├── test_manager.py      # 生命周期、回退与探测一致性
+    ├── test_config.py       # 敏感缓存加密及迁移
+    ├── test_cli.py          # 测速导出回归
+    └── test_gui.py          # 异步配置、复制与探测结果回归
 ```
+
+测试：安装 `pytest` 后执行 `python -m pytest -q`。GUI 用例需要 `requirements.txt` 中的依赖；真实内核用例需要根目录/PATH 中的 `xray.exe`，也可通过 `XRAY_TEST_EXECUTABLE` 指定路径。缺少 GUI 依赖或内核时，相应回归用例会标记为跳过。
 
 ---
 

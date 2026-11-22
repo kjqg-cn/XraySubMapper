@@ -136,7 +136,7 @@ def parse_subscription_content(content: str) -> Tuple[List[ProxyNode], List[str]
     nodes: List[ProxyNode] = []
     errors: List[str] = []
 
-    content = content.strip()
+    content = content.strip().lstrip("\ufeff").strip()
     if not content:
         return nodes, ["订阅内容为空"]
 
@@ -164,7 +164,7 @@ def parse_subscription_content(content: str) -> Tuple[List[ProxyNode], List[str]
     is_plain_links = any(first_lower.startswith(p) for p in SUPPORTED_SCHEMES)
     if not is_plain_links:
         try:
-            decoded_text = safe_b64decode(content)
+            decoded_text = safe_b64decode(content).lstrip("\ufeff").strip()
         except Exception:
             decoded_text = ""
 
