@@ -65,6 +65,19 @@ def _authority_port(parsed: ParseResult, default_port: int) -> int:
     return default_port if port is None else port
 
 
+def _parse_proxy_port(value: Any, protocol: str) -> int:
+    message = f"{protocol} port 须为 0~65535 的整数"
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(message)
+    try:
+        port = int(value)
+    except ValueError:
+        raise ValueError(message) from None
+    if not 0 <= port <= 65535:
+        raise ValueError(message)
+    return port
+
+
 def _split_host_port(host_port: str, default_port: int = 443) -> Tuple[str, int]:
     """Safely split host:port including bracketed IPv6 like [2001:db8::1]:8388."""
     parsed = urlparse("//" + host_port.strip())
@@ -226,6 +239,8 @@ class VMessNode(ProxyNode):
         raw_link: str = "",
     ):
         super().__init__(name, "vmess", server, port, raw_link)
+        if self.enabled and not str(uuid or "").strip():
+            raise ValueError("VMess 缺少 UUID")
         self.uuid = uuid
         self.alter_id = _safe_int(alter_id, 0)
         self.security = security or "auto"
@@ -451,6 +466,8 @@ class TrojanNode(ProxyNode):
         raw_link: str = "",
     ):
         super().__init__(name, "trojan", server, port, raw_link)
+        if self.enabled and not password:
+            raise ValueError("Trojan 缺少密码")
         self.password = password
         self.network = (network or "tcp").lower()
         self.header_type = header_type or "none"
@@ -713,7 +730,7 @@ def parse_vmess(link: str) -> VMessNode:
     return VMessNode(
         name=str(data.get("ps") or unquote(fragment)).strip(),
         server=str(data.get("add") or "").strip(),
-        port=_safe_int(data.get("port"), 443),
+        port=_parse_proxy_port(data.get("port", 443), "VMess"),
         uuid=str(data.get("id") or "").strip(),
         alter_id=_safe_int(data.get("aid"), 0),
         security=str(data.get("scy") or "auto").strip(),
@@ -983,11 +1000,15 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
         paths = http_opts.get("path")
         if isinstance(paths, list) and paths:
             path = str(paths[0])
+        elif isinstance(paths, str):
+            path = paths
         headers = http_opts.get("headers")
         if isinstance(headers, dict):
             h_list = headers.get("Host") or headers.get("host")
             if isinstance(h_list, list) and h_list:
                 host = str(h_list[0])
+            elif isinstance(h_list, str):
+                host = h_list
 
     sni = str(p.get("servername") or p.get("sni") or "").strip()
     if p.get("fingerprint"):
@@ -1041,15 +1062,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
     ptype = str(p.get("type", "")).lower()
     name = str(p.get("name", "")).strip()
     server = str(p.get("server", "")).strip()
-    port_value = p.get("port", 443)
-    if isinstance(port_value, bool) or not isinstance(port_value, (int, str)):
-        raise ValueError("Clash port 须为 0~65535 的整数")
-    try:
-        port = int(port_value)
-    except ValueError:
-        raise ValueError("Clash port 须为 0~65535 的整数") from None
-    if not 0 <= port <= 65535:
-        raise ValueError("Clash port 须为 0~65535 的整数")
+    port = _parse_proxy_port(p.get("port", 443), "Clash")
     if ptype in ("vmess", "vless", "trojan"):
         tr = _extract_clash_transport(p)
 
@@ -1060,7 +1073,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             name=name,
             server=server,
             port=port,
-            uuid=str(p.get("uuid", "")),
+            uuid=str(p.get("uuid") or ""),
             alter_id=_safe_int(p.get("alterId"), 0),
             security=str(p.get("cipher") or "auto"),
             network=tr["network"],
@@ -1097,11 +1110,12 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
         )
     if ptype == "trojan":
         security = "reality" if tr["has_reality"] else ("tls" if _clash_tls_enabled(p.get("tls", True)) else "none")
+        password = p.get("password")
         return TrojanNode(
             name=name,
             server=server,
             port=port,
-            password=str(p.get("password", "")),
+            password="" if password is None else str(password),
             network=tr["network"],
             header_type=tr["header_type"],
             security=security,

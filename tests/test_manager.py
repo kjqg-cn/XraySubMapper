@@ -1,10 +1,14 @@
 import copy
+import ctypes
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -101,6 +105,44 @@ def test_reload_can_reuse_own_ports(kernel_manager, make_node, free_port):
         assert sock.recv(2) == b"\x05\xff"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows wildcard binding semantics")
+@pytest.mark.parametrize("family", [socket.AF_INET, socket.AF_INET6])
+@pytest.mark.parametrize("sock_type", [socket.SOCK_STREAM, socket.SOCK_DGRAM])
+def test_start_rejects_existing_wildcard_listener(kernel_manager, make_node, family, sock_type):
+    with socket.socket(family, sock_type) as busy:
+        if family == socket.AF_INET6:
+            busy.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        busy.bind(("0.0.0.0" if family == socket.AF_INET else "::", 0))
+        if sock_type == socket.SOCK_STREAM:
+            busy.listen()
+        port = busy.getsockname()[1]
+        reported_busy = kernel_manager.check_port_in_use(port, "127.0.0.1")
+        ok, message = kernel_manager.start([make_node(port=port)], "127.0.0.1")
+        assert reported_busy and not ok, message
+        assert "占用" in message and str(port) in message
+        assert kernel_manager.process is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows IP Helper port tables")
+@pytest.mark.parametrize("address", ["::1", "::"])
+@pytest.mark.parametrize("sock_type", [socket.SOCK_STREAM, socket.SOCK_DGRAM])
+def test_ipv4_reload_ignores_ipv6_only_listener(kernel_manager, make_node, address, sock_type):
+    with socket.socket(socket.AF_INET6, sock_type) as busy:
+        busy.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            busy.bind((address, 0))
+        except OSError:
+            pytest.skip("IPv6 is unavailable")
+        if sock_type == socket.SOCK_STREAM:
+            busy.listen()
+        node = make_node(port=busy.getsockname()[1])
+        ok, message = kernel_manager.start([node], "127.0.0.1")
+        assert ok, message
+        ok, message = kernel_manager.reload([node], "0.0.0.0")
+        assert ok, message
+        assert kernel_manager.is_running() and kernel_manager.listen_ip == "0.0.0.0"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows IP Helper port tables")
 @pytest.mark.parametrize("sock_type", [socket.SOCK_STREAM, socket.SOCK_DGRAM])
 def test_reload_to_wildcard_rejects_a_conflicting_interface(kernel_manager, make_node, sock_type):
@@ -126,8 +168,35 @@ def test_reload_to_wildcard_rejects_a_conflicting_interface(kernel_manager, make
         assert ok, message
         original = manager.process
         ok, message = manager.reload([node], "0.0.0.0")
-        assert not ok and "已占用" in message and str(port) in message
+        assert not ok and "占用" in message and str(port) in message
         assert manager.process is original and manager.is_running() and manager.listen_ip == "127.0.0.1"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows IP Helper port tables")
+@pytest.mark.parametrize("truncated", [False, True])
+def test_ipv4_port_validation_handles_disabled_ipv6_and_truncated_tables(
+    manager, make_node, free_port, monkeypatch, truncated,
+):
+    families = []
+
+    def get_table(data, size, ordered, family, table_class, reserved):
+        families.append(family)
+        if family == socket.AF_INET6:
+            return 50  # ERROR_NOT_SUPPORTED, as on a system without IPv6.
+        payload = struct.pack("=I", 1 if truncated else 0)
+        ctypes.cast(size, ctypes.POINTER(ctypes.c_uint32)).contents.value = len(payload)
+        if data is None:
+            return 122
+        ctypes.memmove(data, payload, len(payload))
+        return 0
+
+    helper = SimpleNamespace(GetExtendedTcpTable=get_table, GetExtendedUdpTable=get_table)
+    monkeypatch.setattr(manager_module.ctypes.windll, "iphlpapi", helper)
+    ok, message = manager.validate_node_ports([make_node(port=free_port())], "127.0.0.1")
+    assert ok is not truncated
+    assert set(families) == {socket.AF_INET}
+    if truncated:
+        assert "端口表" in message
 
 
 def test_reject_old_kernel_before_submitting_config(manager, monkeypatch, tmp_path):
@@ -208,6 +277,39 @@ def test_stop_interrupts_preflight_process(manager, make_node, monkeypatch, free
     assert children[0].stdin.closed and children[0].stdout.closed
 
 
+@pytest.mark.parametrize("reason", ["cancel", "timeout"])
+def test_preflight_preserves_original_error_when_kill_races_with_exit(manager, monkeypatch, reason):
+    real_popen = subprocess.Popen
+    children = []
+
+    def popen(command, **kwargs):
+        child = real_popen([sys.executable, "-c", "import time; time.sleep(20)"], **kwargs)
+        communicate, kill = child.communicate, child.kill
+
+        def communicate_and_cancel(payload):
+            if reason == "cancel":
+                manager._stop_requested.set()
+            return communicate(payload)
+
+        def kill_and_raise():
+            kill()
+            raise PermissionError("Process exited during TerminateProcess")
+
+        child.communicate = communicate_and_cancel
+        child.kill = kill_and_raise
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    if reason == "timeout":
+        ticks = iter((0.0, 11.0))
+        monkeypatch.setattr(manager_module.time, "monotonic", lambda: next(ticks))
+    expected = InterruptedError if reason == "cancel" else subprocess.TimeoutExpired
+    with pytest.raises(expected):
+        manager._run_preflight([sys.executable])
+    assert children[0].poll() is not None and children[0].stdout.closed
+
+
 def test_start_checks_all_ports_before_publishing(kernel_manager, make_node, free_port, monkeypatch):
     manager = kernel_manager
     ports = {free_port(), free_port()}
@@ -239,7 +341,9 @@ def test_start_checks_all_ports_before_publishing(kernel_manager, make_node, fre
     assert {item["local_port"] for item in manager.active_mappings} == ports
 
 
-def test_many_ports_start_without_per_port_waits(kernel_manager, make_node):
+def test_many_ports_start_without_per_port_waits(kernel_manager, make_node, monkeypatch):
+    snapshots = Mock(wraps=manager_module._windows_foreign_listener_ports)
+    monkeypatch.setattr(manager_module, "_windows_foreign_listener_ports", snapshots)
     with ExitStack() as reservations:
         ports = []
         for _ in range(270):
@@ -250,6 +354,8 @@ def test_many_ports_start_without_per_port_waits(kernel_manager, make_node):
     ok, message = kernel_manager.start(nodes)
     assert ok, message
     assert set(ports) == {mapping["local_port"] for mapping in kernel_manager.active_mappings}
+    if sys.platform == "win32":
+        assert snapshots.call_count == 1
 
 
 def test_listener_probe_ignores_transient_socket_errors(monkeypatch):
@@ -332,6 +438,42 @@ def test_supported_transports_pass_real_kernel_validation(kernel_manager, transp
     node.local_port = free_port()
     ok, error = kernel_manager.validate_config(kernel_manager.generate_config([node]))
     assert ok, error
+
+
+@pytest.mark.parametrize("result", ["primary", "fallback", "407", "bad_json"])
+def test_exit_ip_responses_close_on_success_and_failure(manager, monkeypatch, result):
+    primary = manager_module.requests.Response()
+    primary.status_code = 407 if result == "407" else 200
+    primary._content = b"ip=192.0.2.1\nloc=US" if result == "primary" else b"not a trace"
+    primary.close = Mock()
+    fallback = manager_module.requests.Response()
+    fallback.status_code = 200
+    fallback._content = b"invalid json" if result == "bad_json" else b'{"ip": "192.0.2.2"}'
+    fallback.close = Mock()
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.get.side_effect = [primary, fallback]
+    monkeypatch.setattr(manager_module.requests, "Session", lambda: session)
+
+    ok, value = manager.probe_exit_ip(19880)
+    assert ok == (result in ("primary", "fallback"))
+    assert value == {"primary": "192.0.2.1 (US)", "fallback": "192.0.2.2"}.get(result, "")
+    primary.close.assert_called_once()
+    if result in ("fallback", "bad_json"):
+        fallback.close.assert_called_once()
+    else:
+        assert session.get.call_count == 1
+
+
+@pytest.mark.parametrize("message", ["Tunnel connection failed: 407", "Tunnel connection failed: 407 Unauthorized"])
+def test_bare_proxy_auth_error_stops_exit_ip_fallback(manager, monkeypatch, message):
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.get.side_effect = manager_module.requests.exceptions.ProxyError(message)
+    monkeypatch.setattr(manager_module.requests, "Session", lambda: session)
+    assert manager.probe_exit_ip(19880) == (False, "")
+    assert session.get.call_count == 1
+    assert manager.test_single_proxy(19880, session=session)[2] == "代理鉴权失败 (407)"
 
 
 @pytest.mark.parametrize("probe", ["speed", "exit"])

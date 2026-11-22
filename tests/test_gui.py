@@ -1,4 +1,6 @@
+import base64
 import copy
+import json
 import os
 import subprocess
 import sys
@@ -13,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
+from core import config
 from core.config import CacheSaveResult, DEFAULT_SETTINGS
 from gui.app import MainWindow, ProbeTask
 from gui.widgets import ProxySettingsDialog, extract_region_and_clean_name
@@ -49,6 +52,67 @@ def spin(application, predicate):
             return
         time.sleep(0.005)
     pytest.fail("GUI worker did not finish")
+
+
+@pytest.fixture
+def protected_settings(window, tmp_path, monkeypatch):
+    path = tmp_path / "app_settings.json"
+    original = b'{"auth_pass": "legacy-fixture"'
+    path.write_bytes(original)
+    monkeypatch.setattr(config, "CONFIG_FILE", str(path))
+    monkeypatch.setattr(config, "_UNREADABLE_FILES", set())
+    monkeypatch.setattr("gui.app.save_settings", config.save_settings)
+    with pytest.warns(RuntimeWarning, match="无法读取"):
+        window.settings = config.load_settings()
+    return path, original
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+@pytest.mark.parametrize("action", ["import", "subscription", "listen", "port", "rearrange", "clear", "history"])
+def test_explicit_actions_recover_protected_settings(window, protected_settings, make_node, monkeypatch, action):
+    path, original = protected_settings
+    if action == "import":
+        window._parse_and_load_raw_text(make_node().raw_link)
+    elif action == "subscription":
+        request = object()
+        window._fetch_request = request
+        window._on_fetch_finished(request, "https://example.com/new-sub", ([make_node()], [], {}), "")
+    elif action == "listen":
+        window.combo_listen.setValue("0.0.0.0", emit_signal=True)
+    elif action in ("port", "rearrange"):
+        window.inp_start_port.setText("19880")
+        if action == "port":
+            window._on_start_port_edited()
+        else:
+            window._rearrange_ports_clicked()
+    elif action == "clear":
+        window.nodes = [make_node()]
+        window.table_model.set_nodes(window.nodes)
+        from PySide6.QtWidgets import QMessageBox
+
+        monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+        monkeypatch.setattr("gui.app.clear_cached_nodes", lambda **kwargs: CacheSaveResult())
+        window._clear_all_nodes()
+    else:
+        window.settings["recent_urls"] = ["https://example.com/old-sub"]
+        window._clear_recent_urls()
+
+    assert path.read_bytes() != original
+    backups = list(path.parent.glob("app_settings.json.*.bak"))
+    assert len(backups) == 1
+    envelope = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert config._crypt_data(base64.b64decode(envelope["data"]), protect=False) == original
+    assert config.load_settings() == window.settings
+    assert "原缓存已备份至:" in window.txt_console.toPlainText()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+def test_window_autosave_keeps_unreadable_settings(window, protected_settings):
+    path, original = protected_settings
+    with pytest.warns(RuntimeWarning, match="阻止覆盖"):
+        window._save_window_state()
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob("*.bak"))
 
 
 @pytest.mark.parametrize("edit", ["port", "auth", "listen"])
@@ -210,6 +274,19 @@ def test_clear_empty_view_can_recover_protected_cache(window, monkeypatch):
     assert not window.nodes
 
 
+def test_clear_nodes_resets_search_before_next_import(window, make_node, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    window._load_new_nodes([make_node("old")])
+    window.inp_search.setText("old")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr("gui.app.clear_cached_nodes", lambda **kwargs: CacheSaveResult())
+    window._clear_all_nodes()
+    assert not window.inp_search.text()
+    window._load_new_nodes([make_node("new")])
+    assert window.proxy_model.rowCount() == 1
+
+
 @pytest.mark.parametrize("kind", ["speed", "exit"])
 def test_single_and_batch_probes_share_a_task(window, application, make_node, monkeypatch, kind):
     window._load_new_nodes([make_node("first"), make_node("second")])
@@ -280,7 +357,8 @@ def test_closing_with_service_transition_waits_off_gui_thread(window, applicatio
 
 
 @pytest.mark.parametrize("running", [False, True])
-def test_run_gui_exits_after_hidden_window_closes(running):
+@pytest.mark.parametrize("force_quit", [False, True])
+def test_run_gui_exits_after_hidden_window_closes(running, force_quit):
     # Run the production event loop in an isolated process.
     code = f"""
 from unittest.mock import Mock
@@ -308,7 +386,7 @@ class HiddenWindow(gui.MainWindow):
 
     def quit_hidden(self):
         self.hide()
-        self._quit_completely()
+        self._quit_completely() if {force_quit!r} else self.close()
 
     def check_cleanup(self):
         print("manager closed", self.xray_mgr.close.call_count)
@@ -319,6 +397,64 @@ gui.run_gui()
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert b"manager closed 1" in result.stdout
+
+
+def test_close_prompt_reentry_and_tray_quit_cleanup_once():
+    code = f"""
+from unittest.mock import Mock
+from PySide6.QtCore import QCoreApplication, QTimer
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QApplication, QMessageBox
+import gui.app as gui
+
+gui.load_settings = lambda: {DEFAULT_SETTINGS!r}
+gui.load_cached_nodes = list
+gui.save_settings = Mock(return_value=gui.CacheSaveResult())
+gui.save_cached_nodes = Mock(return_value=gui.CacheSaveResult())
+gui._set_windows_app_user_model_id = lambda: None
+prompts = []
+real_exec = QMessageBox.exec
+
+def exec_prompt(box):
+    prompts.append(box)
+    return real_exec(box)
+
+QMessageBox.exec = exec_prompt
+
+def dismiss_prompts():
+    for widget in QApplication.topLevelWidgets():
+        if isinstance(widget, QMessageBox):
+            widget.reject()
+
+class PromptWindow(gui.MainWindow):
+    def _setup_tray(self):
+        self.tray = Mock()
+        self.tray.isVisible.return_value = True
+
+    def __init__(self):
+        super().__init__()
+        self._watchdog.stop()
+        self.xray_mgr.is_running = lambda: True
+        self.xray_mgr.close = Mock(return_value=(True, "closed"))
+        QTimer.singleShot(0, self.begin_close)
+        QTimer.singleShot(2000, lambda: QApplication.instance().exit(3))
+        QApplication.instance().aboutToQuit.connect(self.check_cleanup)
+
+    def begin_close(self):
+        QTimer.singleShot(0, lambda: QCoreApplication.sendEvent(self, QCloseEvent()))
+        QTimer.singleShot(30, self._quit_completely)
+        QTimer.singleShot(150, dismiss_prompts)
+        self.close()
+
+    def check_cleanup(self):
+        print("prompts", len(prompts), "closed", self.xray_mgr.close.call_count)
+
+gui.MainWindow = PromptWindow
+gui.run_gui()
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert b"prompts 1 closed 1" in result.stdout
 
 
 def test_incomplete_auth_cannot_be_saved(window, monkeypatch):

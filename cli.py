@@ -16,7 +16,9 @@ def run_cli(args: argparse.Namespace) -> None:
     auth_pass = getattr(args, "auth_pass", None)
     if auth_user and auth_pass is None:
         auth_pass = os.environ.get("XRAY_AUTH_PASS")
-    if (auth_user is not None or auth_pass is not None) and not (auth_user and auth_pass):
+    if (auth_user is not None or auth_pass is not None) and not (
+        auth_user and auth_user.strip() and auth_pass and auth_pass.strip()
+    ):
         print("[-] 请提供 --auth-user 和 --auth-pass（也可通过 XRAY_AUTH_PASS 设置密码）")
         sys.exit(1)
 

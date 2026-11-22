@@ -85,3 +85,38 @@ def test_cli_cancels_during_start_and_loads_auth_from_environment(make_node, mon
     cli.run_cli(args)
     manager.close.assert_called_once()
     manager.test_all_proxies.assert_not_called()
+
+
+@pytest.mark.parametrize("auth_user,auth_pass", [(" ", "password"), ("user", "\t"), ("user", None)])
+def test_blank_cli_credentials_are_rejected_before_download(monkeypatch, capsys, auth_user, auth_pass):
+    monkeypatch.setenv("XRAY_AUTH_PASS", " \t ")
+    fetch = Mock()
+    monkeypatch.setattr(cli, "fetch_subscription_with_meta", fetch)
+    args = argparse.Namespace(sub="https://example.com/sub", auth_user=auth_user, auth_pass=auth_pass)
+    with pytest.raises(SystemExit) as error:
+        cli.run_cli(args)
+    assert error.value.code == 1
+    assert "--auth-user" in capsys.readouterr().out
+    fetch.assert_not_called()
+
+
+def test_cli_preserves_nonblank_credentials_and_explicit_password(make_node, monkeypatch):
+    manager = Mock()
+    manager.close.return_value = True, "OK"
+    handlers = {}
+    monkeypatch.setenv("XRAY_AUTH_PASS", "environment-password")
+    monkeypatch.setattr(cli, "XrayManager", lambda **kwargs: manager)
+    monkeypatch.setattr(cli, "fetch_subscription_with_meta", lambda url: (make_node().raw_link, {}))
+    monkeypatch.setattr(cli.signal, "signal", lambda sig, handler: handlers.update({sig: handler}))
+
+    def start(nodes, listen_ip, **kwargs):
+        assert kwargs == {"auth_user": " user ", "auth_pass": " pass "}
+        handlers[cli.signal.SIGINT](cli.signal.SIGINT, None)
+        return False, "cancelled"
+
+    manager.start.side_effect = start
+    args = argparse.Namespace(sub="https://example.com/sub", file=None, start_port=19890,
+                              listen="127.0.0.1", max_nodes=0, test=False, export=None,
+                              auth_user=" user ", auth_pass=" pass ")
+    cli.run_cli(args)
+    manager.close.assert_called_once()

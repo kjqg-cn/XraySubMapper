@@ -15,7 +15,7 @@ import time
 import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -191,18 +191,26 @@ def _ready_tcp_ports(host: str, ports: List[int], timeout: float) -> set[int]:
     return ready
 
 
-def _windows_foreign_listener_ports(exclude_pid: int) -> set[int]:
+def _windows_foreign_listener_ports(listen_ip: str, exclude_pid: int = 0) -> set[int]:
+    if ":" in listen_ip:
+        addresses = {socket.AF_INET6: socket.inet_pton(socket.AF_INET6, listen_ip.split("%", 1)[0])}
+        if addresses[socket.AF_INET6] == bytes(16):
+            addresses[socket.AF_INET] = bytes(4)  # Xray's IPv6 wildcard listener is dual-stack.
+    else:
+        addresses = {socket.AF_INET: socket.inet_aton(socket.gethostbyname(listen_ip or "0.0.0.0"))}
     ip_helper = ctypes.windll.iphlpapi
-    # MIB_*ROW_OWNER_PID layouts, retaining dwLocalPort and dwOwningPid.
+    # MIB_*ROW_OWNER_PID layouts, retaining the local address, port and owning PID.
     tables = (
-        (ip_helper.GetExtendedTcpTable, _TCP_TABLE_OWNER_PID_LISTENER, socket.AF_INET, "8xI8xI"),
-        (ip_helper.GetExtendedTcpTable, _TCP_TABLE_OWNER_PID_LISTENER, socket.AF_INET6, "20xI28xI"),
-        (ip_helper.GetExtendedUdpTable, _UDP_TABLE_OWNER_PID, socket.AF_INET, "4xII"),
-        (ip_helper.GetExtendedUdpTable, _UDP_TABLE_OWNER_PID, socket.AF_INET6, "20xII"),
+        (ip_helper.GetExtendedTcpTable, _TCP_TABLE_OWNER_PID_LISTENER, socket.AF_INET, "4x4sI8xI"),
+        (ip_helper.GetExtendedTcpTable, _TCP_TABLE_OWNER_PID_LISTENER, socket.AF_INET6, "16s4xI28xI"),
+        (ip_helper.GetExtendedUdpTable, _UDP_TABLE_OWNER_PID, socket.AF_INET, "4sII"),
+        (ip_helper.GetExtendedUdpTable, _UDP_TABLE_OWNER_PID, socket.AF_INET6, "16s4xII"),
     )
     dword = ctypes.c_uint32
     ports = set()
     for get_table, table_class, family, row_format in tables:
+        if family not in addresses:
+            continue
         get_table.argtypes = [ctypes.c_void_p, ctypes.POINTER(dword), ctypes.c_int, dword, ctypes.c_int, dword]
         get_table.restype = dword
         size = dword()
@@ -217,10 +225,17 @@ def _windows_foreign_listener_ports(exclude_pid: int) -> set[int]:
         if data is None:
             continue
         row = struct.Struct("=" + row_format)
+        available = min(size.value, len(data))
+        if available < ctypes.sizeof(dword):
+            raise OSError("Windows 监听端口表数据不完整")
         count, = struct.unpack_from("=I", data)
         end = ctypes.sizeof(dword) + count * row.size
-        for port, pid in row.iter_unpack(memoryview(data)[ctypes.sizeof(dword):end]):
-            if pid != exclude_pid:
+        if end > available:
+            raise OSError("Windows 监听端口表数据不完整")
+        target = addresses[family]
+        wildcard = bytes(len(target))
+        for address, port, pid in row.iter_unpack(memoryview(data)[ctypes.sizeof(dword):end]):
+            if pid != exclude_pid and (target == wildcard or address in (target, wildcard)):
                 ports.add(socket.ntohs(port & 0xFFFF))
     return ports
 
@@ -229,7 +244,8 @@ def _local_proxy_error(exc: Exception) -> str:
     message = str(exc).lower()
     if "connection refused" in message or "10061" in message:
         return "本地端口未监听"
-    if "407 proxy" in message:
+    if (getattr(getattr(exc, "response", None), "status_code", None) == 407
+            or re.search(r"\b407\s+proxy\b|\btunnel connection failed:\s*407\b", message)):
         return "代理鉴权失败 (407)"
     return ""
 
@@ -289,8 +305,18 @@ class XrayManager:
             print(f"[XrayManager] {msg}")
 
     @staticmethod
-    def check_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    def check_port_in_use(
+        port: int, host: str = "127.0.0.1", listener_ports: Optional[set[int]] = None,
+    ) -> bool:
         """Check the TCP and UDP sockets required by a mixed inbound."""
+        if sys.platform == "win32":
+            try:
+                if listener_ports is None:
+                    listener_ports = _windows_foreign_listener_ports(host)
+                if port in listener_ports:
+                    return True
+            except OSError:
+                return True
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         for sock_type in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             try:
@@ -305,7 +331,7 @@ class XrayManager:
     @staticmethod
     def validate_node_ports(
         nodes: List[ProxyNode], listen_ip: str = "127.0.0.1", owned_ports: Optional[set] = None,
-        cancelled: Optional[Callable[[], bool]] = None,
+        cancelled: Optional[Callable[[], bool]] = None, exclude_pid: int = 0,
     ) -> Tuple[bool, str]:
         """Validate port range, internal duplicates, and external port conflicts."""
         active_nodes = [n for n in nodes if n.enabled]
@@ -326,13 +352,20 @@ class XrayManager:
                 )
             seen_ports[n.local_port] = n.name
 
+        try:
+            listener_ports = _windows_foreign_listener_ports(listen_ip, exclude_pid) if sys.platform == "win32" else None
+        except OSError as exc:
+            return False, f"无法核对监听地址的端口占用: {exc}"
         conflict_ports = []
         for n in active_nodes:
             if cancelled is not None and cancelled():
                 return False, "端口校验已取消"
+            if listener_ports is not None and n.local_port in listener_ports:
+                conflict_ports.append(f"{n.local_port} ({n.name})")
+                continue
             if owned_ports and n.local_port in owned_ports:
                 continue
-            if XrayManager.check_port_in_use(n.local_port, listen_ip):
+            if XrayManager.check_port_in_use(n.local_port, listen_ip, listener_ports):
                 conflict_ports.append(f"{n.local_port} ({n.name})")
 
         if conflict_ports:
@@ -447,7 +480,8 @@ class XrayManager:
             worker.start()
         except RuntimeError:
             with proc:
-                proc.kill()
+                with suppress(OSError):
+                    proc.kill()
             raise
         try:
             deadline = time.monotonic() + 10
@@ -459,7 +493,8 @@ class XrayManager:
         finally:
             try:
                 if not done.is_set():
-                    proc.kill()
+                    with suppress(OSError):
+                        proc.kill()
             finally:
                 worker.join(timeout=2.0)
         if errors:
@@ -523,9 +558,9 @@ class XrayManager:
 
     def _prepare_config(
         self, nodes: List[ProxyNode], listen_ip: str, auth_user: str, auth_pass: str,
-        owned_ports: Optional[set] = None,
+        owned_ports: Optional[set] = None, exclude_pid: int = 0,
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports, self._is_cancelled)
+        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports, self._is_cancelled, exclude_pid)
         if not ok:
             return False, err, {}
         try:
@@ -670,16 +705,10 @@ class XrayManager:
             )
             if was_running and shared_bind:
                 owned_ports = {n.local_port for n in self._active_nodes}
-            reused = owned_ports.intersection(n.local_port for n in active_nodes)
-            if sys.platform == "win32" and reused and listen_ip in ("0.0.0.0", "::") and listen_ip != self.listen_ip:
-                try:
-                    conflicts = reused & _windows_foreign_listener_ports(self.process.pid)
-                except OSError as exc:
-                    return False, f"无法核对通配监听地址的端口占用: {exc}"
-                if conflicts:
-                    ports = ", ".join(map(str, sorted(conflicts)[:6]))
-                    return False, f"其他程序已占用 {len(conflicts)} 个待复用端口（{ports}）"
-            ok, msg, config = self._prepare_config(active_nodes, listen_ip, auth_user, auth_pass, owned_ports)
+            ok, msg, config = self._prepare_config(
+                active_nodes, listen_ip, auth_user, auth_pass, owned_ports,
+                self.process.pid if was_running else 0,
+            )
             if not ok:
                 return False, msg
             if self._is_cancelled():
@@ -839,30 +868,30 @@ class XrayManager:
             sess.trust_env = False
             # Primary: Cloudflare trace (fast, returns both IP and 2-letter country code)
             try:
-                resp = sess.get("https://cp.cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=timeout)
-                if resp.status_code == 407:
-                    return False, ""
-                if resp.status_code == 200 and "ip=" in resp.text:
-                    kv = {}
-                    for line in resp.text.splitlines():
-                        if "=" in line:
-                            k, v = line.split("=", 1)
-                            kv[k.strip()] = v.strip()
-                    ip = kv.get("ip", "")
-                    loc = kv.get("loc", "")
-                    if ip:
-                        return True, f"{ip} ({loc})" if loc else ip
+                with sess.get("https://cp.cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=timeout) as resp:
+                    if resp.status_code == 407:
+                        return False, ""
+                    if resp.status_code == 200 and "ip=" in resp.text:
+                        kv = {}
+                        for line in resp.text.splitlines():
+                            if "=" in line:
+                                k, v = line.split("=", 1)
+                                kv[k.strip()] = v.strip()
+                        ip = kv.get("ip", "")
+                        loc = kv.get("loc", "")
+                        if ip:
+                            return True, f"{ip} ({loc})" if loc else ip
             except requests.RequestException as exc:
                 if _local_proxy_error(exc):
                     return False, ""
 
             # Fallback: ipify
             try:
-                resp = sess.get("https://api.ipify.org?format=json", proxies=proxies, timeout=timeout)
-                if resp.status_code == 200:
-                    ip = str(resp.json().get("ip", "")).strip()
-                    if ip:
-                        return True, ip
+                with sess.get("https://api.ipify.org?format=json", proxies=proxies, timeout=timeout) as resp:
+                    if resp.status_code == 200:
+                        ip = str(resp.json().get("ip", "")).strip()
+                        if ip:
+                            return True, ip
             except Exception:
                 pass
 

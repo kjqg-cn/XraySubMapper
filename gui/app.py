@@ -392,6 +392,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._shutdown_complete = False
         self._force_quit = False
+        self._close_prompt: Optional[QMessageBox] = None
         self._applied_signature: Optional[Tuple] = None
         self._pending_signature: Optional[Tuple] = None
         self._service_busy = False
@@ -1065,11 +1066,13 @@ class MainWindow(QMainWindow):
     def _report_cache_save(self, result: CacheSaveResult) -> None:
         if result.error:
             message, level = result.error, "error"
+            log_message = message
         elif result.backup_path:
             message, level = f"原缓存已备份至 {os.path.basename(result.backup_path)}", "info"
+            log_message = f"原缓存已备份至: {result.backup_path}"
         else:
             return
-        self._append_log(result.backup_path or message)
+        self._append_log(log_message)
         QTimer.singleShot(0, lambda: self._notify(message, level, 4200) if not self._closing else None)
 
     def _persist_nodes(self, *, replace_unreadable: bool = False) -> None:
@@ -1090,7 +1093,7 @@ class MainWindow(QMainWindow):
     def _assign_ports(self, reset_pinned: bool = False, *, replace_unreadable: bool = False) -> None:
         start_p = self._get_start_port()
         self.settings["start_port"] = start_p
-        self._report_cache_save(save_settings(self.settings))
+        self._report_cache_save(save_settings(self.settings, replace_unreadable=replace_unreadable))
 
         if reset_pinned:
             for n in self.nodes:
@@ -1115,18 +1118,18 @@ class MainWindow(QMainWindow):
         self._persist_nodes(replace_unreadable=replace_unreadable)
 
     def _rearrange_ports_clicked(self, reset_pinned: bool = False) -> None:
-        self._assign_ports(reset_pinned=reset_pinned)
+        self._assign_ports(reset_pinned=reset_pinned, replace_unreadable=True)
         msg = "已解除锁定并重排全部端口" if reset_pinned else "已顺延编排端口 (手动锁定的端口已保留)"
         self._notify(msg, "info")
 
     def _on_start_port_edited(self) -> None:
         if self._get_start_port() != self.settings.get("start_port"):
-            self._assign_ports(reset_pinned=False)
+            self._assign_ports(reset_pinned=False, replace_unreadable=True)
 
     def _on_listen_ip_changed(self) -> None:
         ip = str(self.combo_listen.currentData() or "127.0.0.1")
         self.settings["listen_ip"] = ip
-        self._report_cache_save(save_settings(self.settings))
+        self._report_cache_save(save_settings(self.settings, replace_unreadable=True))
         self.table_model.set_listen_ip(ip)
         self._sync_dirty_banner()
         if ip == "0.0.0.0" and not all(self._get_auth_pair()):
@@ -1171,7 +1174,7 @@ class MainWindow(QMainWindow):
 
     def _clear_recent_urls(self) -> None:
         self.settings["recent_urls"] = []
-        self._report_cache_save(save_settings(self.settings))
+        self._report_cache_save(save_settings(self.settings, replace_unreadable=True))
         self._notify("已清空历史订阅记录", "info")
 
     def _fetch_subscription_async(self) -> None:
@@ -1453,8 +1456,9 @@ class MainWindow(QMainWindow):
             self._cancel_probes()
             self._clear_subscription_source()
             self.nodes = []
-            self._report_cache_save(save_settings(self.settings))
+            self._report_cache_save(save_settings(self.settings, replace_unreadable=True))
             self.table_model.set_nodes(self.nodes)
+            self.inp_search.clear()
             self._update_summary_counters()
             self._notify("节点列表已清空", "info")
 
@@ -2003,6 +2007,9 @@ class MainWindow(QMainWindow):
 
     def _quit_completely(self) -> None:
         self._force_quit = True
+        if self._close_prompt is not None:
+            self._close_prompt.reject()
+            return
         self.close()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -2011,10 +2018,14 @@ class MainWindow(QMainWindow):
                 if self.tray:
                     self.tray.hide()
                 event.accept()
-                if self._force_quit:
+                if self._force_quit or not self.isVisible():
                     QTimer.singleShot(0, QApplication.quit)
             else:
                 event.ignore()
+            return
+
+        if self._close_prompt is not None:
+            event.ignore()
             return
 
         if not self._force_quit and self.xray_mgr.is_running() and self.tray and self.tray.isVisible():
@@ -2025,23 +2036,28 @@ class MainWindow(QMainWindow):
             btn_exit = box.addButton("停止服务并退出", QMessageBox.ButtonRole.DestructiveRole)
             box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(btn_tray)
-            box.exec()
+            self._close_prompt = box
+            try:
+                box.exec()
+            finally:
+                self._close_prompt = None
 
-            clicked = box.clickedButton()
-            if clicked == btn_tray:
-                self._save_window_state()
-                event.ignore()
-                self.hide()
-                self.tray.showMessage(
-                    "XraySubMapper 仍在后台运行",
-                    "本地混合代理端口仍可用，双击托盘图标可恢复主窗口。",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    2000,
-                )
-                return
-            if clicked != btn_exit:
-                event.ignore()
-                return
+            if not self._force_quit:
+                clicked = box.clickedButton()
+                if clicked == btn_tray:
+                    self._save_window_state()
+                    event.ignore()
+                    self.hide()
+                    self.tray.showMessage(
+                        "XraySubMapper 仍在后台运行",
+                        "本地混合代理端口仍可用，双击托盘图标可恢复主窗口。",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        2000,
+                    )
+                    return
+                if clicked != btn_exit:
+                    event.ignore()
+                    return
 
         self._closing = True
         self._cancel_probes()

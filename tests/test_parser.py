@@ -92,10 +92,50 @@ def test_invalid_ports_and_required_fields_are_reported_at_import(text):
     assert not nodes and len(errors) == 1
 
 
+@pytest.mark.parametrize("bad", [
+    "trojan://@example.com:443",
+    "proxies: [{type: trojan, server: example.com, port: 443, password: null}]",
+    "proxies: [{type: vmess, server: example.com, port: 443, uuid: null}]",
+    "proxies: [{type: vmess, server: example.com, port: 443, uuid: ' '}]",
+    "vmess://" + base64.b64encode(json.dumps({"add": "example.com", "port": 443}).encode()).decode(),
+])
+def test_missing_vmess_and_trojan_credentials_do_not_break_valid_subscription(bad):
+    if bad.startswith("proxies:"):
+        content = bad.replace("proxies: [", "proxies: [{type: trojan, name: good, server: example.net, port: 443, password: valid}, ", 1)
+    else:
+        content = "trojan://valid@example.net:443#good\n" + bad
+    nodes, errors = parse_subscription_content(content)
+    assert [node.name for node in nodes] == ["good"]
+    assert len(errors) == 1
+
+
+@pytest.mark.parametrize("port", ["bad", "", None, True, 1.5, -1, 65536])
+def test_vmess_rejects_malformed_explicit_port(port):
+    payload = base64.b64encode(json.dumps({"add": "example.com", "id": UUID, "port": port}).encode()).decode()
+    nodes, errors = parse_subscription_content("vmess://" + payload)
+    assert not nodes and len(errors) == 1
+
+
+@pytest.mark.parametrize("protocol", ["vmess", "trojan"])
+def test_placeholder_nodes_can_omit_credentials(protocol):
+    node = parse_clash_proxy({"type": protocol, "name": "remaining quota", "server": "127.0.0.1", "port": 1})
+    assert not node.enabled
+
+
 def test_empty_clash_http_opts_leaves_plain_tcp():
     proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "network": "tcp", "http-opts": {}}
     stream = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]
     assert stream["network"] == "tcp" and "tcpSettings" not in stream
+
+
+@pytest.mark.parametrize("single_value", [False, True])
+def test_clash_http_path_and_host_preserve_single_and_list_values(single_value):
+    path = "/custom" if single_value else ["/custom"]
+    host = "cdn.example.com" if single_value else ["cdn.example.com"]
+    proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "network": "tcp",
+             "http-opts": {"path": path, "headers": {"Host": host}}}
+    request = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]["tcpSettings"]["header"]["request"]
+    assert request == {"path": ["/custom"], "headers": {"Host": ["cdn.example.com"]}}
 
 
 def test_clash_xhttp_fields_survive_cache_roundtrip():
