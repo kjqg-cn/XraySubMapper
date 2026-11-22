@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 
 import pytest
 
@@ -100,6 +101,35 @@ def test_reload_can_reuse_own_ports(kernel_manager, make_node, free_port):
         assert sock.recv(2) == b"\x05\xff"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows IP Helper port tables")
+@pytest.mark.parametrize("sock_type", [socket.SOCK_STREAM, socket.SOCK_DGRAM])
+def test_reload_to_wildcard_rejects_a_conflicting_interface(kernel_manager, make_node, sock_type):
+    addresses = socket.gethostbyname_ex(socket.gethostname())[2]
+    with socket.socket(socket.AF_INET, sock_type) as busy:
+        busy.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        for address in addresses:
+            if address.startswith("127."):
+                continue
+            try:
+                busy.bind((address, 0))
+            except OSError:
+                continue
+            break
+        else:
+            pytest.skip("A bindable non-loopback IPv4 address is required")
+        if sock_type == socket.SOCK_STREAM:
+            busy.listen()
+        port = busy.getsockname()[1]
+        node = make_node(port=port)
+        manager = kernel_manager
+        ok, message = manager.start([node], "127.0.0.1")
+        assert ok, message
+        original = manager.process
+        ok, message = manager.reload([node], "0.0.0.0")
+        assert not ok and "已占用" in message and str(port) in message
+        assert manager.process is original and manager.is_running() and manager.listen_ip == "127.0.0.1"
+
+
 def test_reject_old_kernel_before_submitting_config(manager, monkeypatch, tmp_path):
     kernel = tmp_path / "xray.exe"
     kernel.write_bytes(b"old")
@@ -142,11 +172,19 @@ def test_stop_interrupts_preflight_process(manager, make_node, monkeypatch, free
     real_popen = subprocess.Popen
     entered = threading.Event()
     children = []
+    wait_threads = set()
     results = []
 
     def popen(command, **kwargs):
         assert command[1:3] == ["run", "-test"]
         child = real_popen([sys.executable, "-c", "import time; time.sleep(20)"], **kwargs)
+        wait = child.wait
+
+        def record_wait(*args, **kwargs):
+            wait_threads.add(threading.get_ident())
+            return wait(*args, **kwargs)
+
+        child.wait = record_wait
         children.append(child)
         entered.set()
         return child
@@ -165,6 +203,9 @@ def test_stop_interrupts_preflight_process(manager, make_node, monkeypatch, free
     finally:
         starter.join(5)
     assert not results[0][0] and "取消" in results[0][1]
+    assert wait_threads and len(wait_threads) == 1
+    assert starter.ident not in wait_threads and threading.get_ident() not in wait_threads
+    assert children[0].stdin.closed and children[0].stdout.closed
 
 
 def test_start_checks_all_ports_before_publishing(kernel_manager, make_node, free_port, monkeypatch):
@@ -176,15 +217,15 @@ def test_start_checks_all_ports_before_publishing(kernel_manager, make_node, fre
     defer_last = threading.Event()
     checking = threading.Event()
     results = []
-    can_connect = manager_module._can_connect
+    ready_tcp_ports = manager_module._ready_tcp_ports
 
-    def connect(host, port, timeout):
-        if timeout <= 0.025 and port == last_port and not defer_last.is_set():
+    def probe(host, ports, timeout):
+        if last_port in ports and not defer_last.is_set():
             checking.set()
-            return False
-        return can_connect(host, port, timeout)
+            ports = [port for port in ports if port != last_port]
+        return ready_tcp_ports(host, ports, timeout)
 
-    monkeypatch.setattr(manager_module, "_can_connect", connect)
+    monkeypatch.setattr(manager_module, "_ready_tcp_ports", probe)
     nodes = [make_node(port=first_port), make_node(port=last_port)]
     starter = threading.Thread(target=lambda: results.append(manager.start(nodes)))
     starter.start()
@@ -196,6 +237,45 @@ def test_start_checks_all_ports_before_publishing(kernel_manager, make_node, fre
         starter.join(5)
     assert results[0][0] and manager.is_running()
     assert {item["local_port"] for item in manager.active_mappings} == ports
+
+
+def test_many_ports_start_without_per_port_waits(kernel_manager, make_node):
+    with ExitStack() as reservations:
+        ports = []
+        for _ in range(270):
+            sock = reservations.enter_context(socket.socket())
+            sock.bind(("127.0.0.1", 0))
+            ports.append(sock.getsockname()[1])
+    nodes = [make_node(port=port) for port in ports]
+    ok, message = kernel_manager.start(nodes)
+    assert ok, message
+    assert set(ports) == {mapping["local_port"] for mapping in kernel_manager.active_mappings}
+
+
+def test_listener_probe_ignores_transient_socket_errors(monkeypatch):
+    real_socket = socket.socket
+    with real_socket() as listener, real_socket() as idle:
+        for sock in (listener, idle):
+            sock.bind(("127.0.0.1", 0))
+        listener.listen()
+        ready_port, idle_port = [sock.getsockname()[1] for sock in (listener, idle)]
+
+        class FlakySocket(real_socket):
+            def connect_ex(self, address):
+                if address[1] == idle_port:
+                    raise OSError("transient error")
+                return super().connect_ex(address)
+
+        monkeypatch.setattr(manager_module.socket, "socket", FlakySocket)
+        assert manager_module._ready_tcp_ports("127.0.0.1", [idle_port, ready_port], 0.1) == {ready_port}
+
+
+def test_explicit_kernel_path_does_not_require_pathext(manager, tmp_path, monkeypatch):
+    kernel = tmp_path / "custom-kernel.bin"
+    kernel.touch()
+    manager.xray_path = str(kernel)
+    monkeypatch.setattr(manager_module.shutil, "which", lambda path: None)
+    assert manager._resolved_xray_path() == str(kernel.resolve())
 
 
 def test_ipv6_listen_and_ipv6_proxy_url(kernel_manager, make_node):
@@ -218,6 +298,14 @@ def test_preflight_detects_udp_conflict(manager, make_node):
         sock.bind(("127.0.0.1", 0))
         ok, msg = manager.validate_node_ports([make_node(port=sock.getsockname()[1])])
         assert not ok and "占用" in msg
+
+
+def test_preflight_detects_reusable_tcp_listener(manager):
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        assert manager.check_port_in_use(sock.getsockname()[1])
 
 
 def test_launch_reports_child_output_on_early_exit(manager, make_node, monkeypatch, free_port):

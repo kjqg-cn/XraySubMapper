@@ -80,6 +80,11 @@ SVG_PATHS: Dict[str, str] = {
 _ICON_CACHE: Dict[Tuple[str, str, int], QIcon] = {}
 
 
+def clear_icon_caches() -> None:
+    _ICON_CACHE.clear()
+    _render_svg_pixmap.cache_clear()
+
+
 def svg_pixmap(name: str, color: str = "#334155", size: int = 16) -> QPixmap:
     app = QGuiApplication.instance()
     dpr = float(app.primaryScreen().devicePixelRatio()) if (app and app.primaryScreen()) else 1.0

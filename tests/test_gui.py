@@ -1,5 +1,7 @@
 import copy
 import os
+import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -11,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
-from core.config import DEFAULT_SETTINGS
+from core.config import CacheSaveResult, DEFAULT_SETTINGS
 from gui.app import MainWindow, ProbeTask
 from gui.widgets import ProxySettingsDialog, extract_region_and_clean_name
 
@@ -25,8 +27,8 @@ def application():
 def window(application, monkeypatch):
     monkeypatch.setattr("gui.app.load_settings", lambda: copy.deepcopy(DEFAULT_SETTINGS))
     monkeypatch.setattr("gui.app.load_cached_nodes", lambda: [])
-    monkeypatch.setattr("gui.app.save_settings", lambda *args: None)
-    monkeypatch.setattr("gui.app.save_cached_nodes", lambda *args: None)
+    monkeypatch.setattr("gui.app.save_settings", lambda *args, **kwargs: CacheSaveResult())
+    monkeypatch.setattr("gui.app.save_cached_nodes", lambda *args, **kwargs: CacheSaveResult())
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: setattr(self, "tray", None))
     window = MainWindow()
     window._watchdog.stop()
@@ -175,6 +177,39 @@ def test_repeated_enter_and_late_fetch_after_manual_import(window, application, 
         release.set()
 
 
+def test_fetch_finishes_for_submitted_url_while_user_edits_next_url(window, make_node):
+    submitted = "https://example.com/sub"
+    draft = "https://example.com/next"
+    request = object()
+    window._fetch_request = request
+    window.inp_url.setText(draft)
+    window._on_fetch_finished(request, submitted, ([make_node("downloaded")], [], {}), "")
+    assert window.nodes[0].name == "downloaded"
+    assert window.inp_url.text() == draft
+    assert window.settings["subscription_url"] == submitted
+
+
+def test_explicit_import_reports_cache_failure(window, application, make_node, monkeypatch):
+    save = Mock(return_value=CacheSaveResult(error="模拟节点缓存写入失败"))
+    monkeypatch.setattr("gui.app.save_cached_nodes", save)
+    window._parse_and_load_raw_text(make_node("manual").raw_link)
+    save.assert_called_once_with(window.nodes, replace_unreadable=True)
+    spin(application, lambda: window._notify.call_args.args[1] == "error")
+    assert "模拟节点缓存写入失败" in window.txt_console.toPlainText()
+
+
+def test_clear_empty_view_can_recover_protected_cache(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr("gui.app.nodes_cache_protected", lambda: True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    clear = Mock(return_value=CacheSaveResult(backup_path="cached_nodes.json.test.bak"))
+    monkeypatch.setattr("gui.app.clear_cached_nodes", clear)
+    window._clear_all_nodes()
+    clear.assert_called_once_with(replace_unreadable=True)
+    assert not window.nodes
+
+
 @pytest.mark.parametrize("kind", ["speed", "exit"])
 def test_single_and_batch_probes_share_a_task(window, application, make_node, monkeypatch, kind):
     window._load_new_nodes([make_node("first"), make_node("second")])
@@ -244,6 +279,48 @@ def test_closing_with_service_transition_waits_off_gui_thread(window, applicatio
         release.set()
 
 
+@pytest.mark.parametrize("running", [False, True])
+def test_run_gui_exits_after_hidden_window_closes(running):
+    # Run the production event loop in an isolated process.
+    code = f"""
+from unittest.mock import Mock
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+import gui.app as gui
+
+gui.load_settings = lambda: {DEFAULT_SETTINGS!r}
+gui.load_cached_nodes = list
+gui.save_settings = Mock(return_value=gui.CacheSaveResult())
+gui.save_cached_nodes = Mock(return_value=gui.CacheSaveResult())
+gui._set_windows_app_user_model_id = lambda: None
+
+class HiddenWindow(gui.MainWindow):
+    def _setup_tray(self):
+        self.tray = None
+
+    def __init__(self):
+        super().__init__()
+        self.xray_mgr.is_running = lambda: {running!r}
+        self.xray_mgr.close = Mock(return_value=(True, "closed"))
+        QTimer.singleShot(0, self.quit_hidden)
+        QTimer.singleShot(3000, lambda: QApplication.instance().exit(3))
+        QApplication.instance().aboutToQuit.connect(self.check_cleanup)
+
+    def quit_hidden(self):
+        self.hide()
+        self._quit_completely()
+
+    def check_cleanup(self):
+        print("manager closed", self.xray_mgr.close.call_count)
+
+gui.MainWindow = HiddenWindow
+gui.run_gui()
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert b"manager closed 1" in result.stdout
+
+
 def test_incomplete_auth_cannot_be_saved(window, monkeypatch):
     warning = Mock()
     monkeypatch.setattr("gui.widgets.QMessageBox.warning", warning)
@@ -301,7 +378,7 @@ def test_busy_service_blocks_window_and_tray_reentry(window, monkeypatch):
     window._set_service_busy(True)
     assert not window.btn_service.isEnabled() and not window.btn_reload_dirty.isEnabled()
     window.act_tray_toggle.setEnabled.assert_called_with(False)
-    start, stop = Mock(), Mock()
+    start, stop = Mock(), Mock(return_value=(True, "OK"))
     monkeypatch.setattr(window.xray_mgr, "start", start)
     monkeypatch.setattr(window.xray_mgr, "stop", stop)
     window._toggle_service()
@@ -349,4 +426,4 @@ def test_cache_read_failure_is_visible_in_gui(window, application, monkeypatch):
     finally:
         other._force_quit = True
         other.close()
-        application.processEvents()
+        spin(application, lambda: other._shutdown_complete)

@@ -10,7 +10,6 @@ from urllib.parse import quote
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QAction,
     QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
@@ -42,16 +41,18 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import (
+    CacheSaveResult,
     clear_cached_nodes,
     load_cached_nodes,
     load_settings,
+    nodes_cache_protected,
     save_cached_nodes,
     save_settings,
 )
 from core.parser import ProxyNode
 from core.subscription import fetch_subscription_with_meta, parse_subscription_content
 from core.xray_manager import XrayManager, format_proxy_host
-from .icons import build_app_logo_icon, icon, svg_pixmap
+from .icons import build_app_logo_icon, clear_icon_caches, icon
 from .widgets import (
     COL_ENABLED,
     COL_INDEX,
@@ -435,7 +436,8 @@ class MainWindow(QMainWindow):
         if cache_warnings:
             details = "\n".join(str(warning.message) for warning in cache_warnings)
             QTimer.singleShot(0, lambda: QMessageBox.warning(
-                self, "缓存读取提示", details + "\n\n读取失败的原文件会保留，请先备份并恢复原账户或文件。",
+                self, "缓存读取提示",
+                details + "\n\n读取失败的原文件会保留。主动导入、清空或保存设置时会先备份。",
             ))
 
     # ------------------------------------------------------------------
@@ -1060,8 +1062,18 @@ class MainWindow(QMainWindow):
         self.btn_export.setText(f" 复制代理 ({enabled})")
         self._sync_dirty_banner()
 
-    def _persist_nodes(self) -> None:
-        save_cached_nodes(self.nodes)
+    def _report_cache_save(self, result: CacheSaveResult) -> None:
+        if result.error:
+            message, level = result.error, "error"
+        elif result.backup_path:
+            message, level = f"原缓存已备份至 {os.path.basename(result.backup_path)}", "info"
+        else:
+            return
+        self._append_log(result.backup_path or message)
+        QTimer.singleShot(0, lambda: self._notify(message, level, 4200) if not self._closing else None)
+
+    def _persist_nodes(self, *, replace_unreadable: bool = False) -> None:
+        self._report_cache_save(save_cached_nodes(self.nodes, replace_unreadable=replace_unreadable))
         self._update_summary_counters()
 
     # ------------------------------------------------------------------
@@ -1075,10 +1087,10 @@ class MainWindow(QMainWindow):
             self.inp_start_port.setText(str(val))
         return val
 
-    def _assign_ports(self, reset_pinned: bool = False) -> None:
+    def _assign_ports(self, reset_pinned: bool = False, *, replace_unreadable: bool = False) -> None:
         start_p = self._get_start_port()
         self.settings["start_port"] = start_p
-        save_settings(self.settings)
+        self._report_cache_save(save_settings(self.settings))
 
         if reset_pinned:
             for n in self.nodes:
@@ -1100,7 +1112,7 @@ class MainWindow(QMainWindow):
                     node.local_port = 0
 
         self.table_model.refresh_all()
-        self._persist_nodes()
+        self._persist_nodes(replace_unreadable=replace_unreadable)
 
     def _rearrange_ports_clicked(self, reset_pinned: bool = False) -> None:
         self._assign_ports(reset_pinned=reset_pinned)
@@ -1114,7 +1126,7 @@ class MainWindow(QMainWindow):
     def _on_listen_ip_changed(self) -> None:
         ip = str(self.combo_listen.currentData() or "127.0.0.1")
         self.settings["listen_ip"] = ip
-        save_settings(self.settings)
+        self._report_cache_save(save_settings(self.settings))
         self.table_model.set_listen_ip(ip)
         self._sync_dirty_banner()
         if ip == "0.0.0.0" and not all(self._get_auth_pair()):
@@ -1159,7 +1171,7 @@ class MainWindow(QMainWindow):
 
     def _clear_recent_urls(self) -> None:
         self.settings["recent_urls"] = []
-        save_settings(self.settings)
+        self._report_cache_save(save_settings(self.settings))
         self._notify("已清空历史订阅记录", "info")
 
     def _fetch_subscription_async(self) -> None:
@@ -1196,8 +1208,6 @@ class MainWindow(QMainWindow):
         if self._closing or request is not self._fetch_request:
             return
         self._reset_fetch()
-        if self.inp_url.text().strip() != url:
-            return
         if result is None:
             QMessageBox.critical(self, "下载订阅失败", f"请求订阅链接时出错：\n{error}")
             return
@@ -1213,9 +1223,6 @@ class MainWindow(QMainWindow):
         self.settings["recent_urls"] = recent[:12]
         self.settings["subscription_url"] = url
         self.settings["sub_userinfo"] = meta
-        save_settings(self.settings)
-        self.inp_url.setText(url)
-
         self._refresh_sub_userinfo_badge()
         self._load_new_nodes(nodes, source_label=f"成功更新订阅 · 导入 {len(nodes)} 个节点", preserve_state=preserve_state)
         self._show_import_errors(errors)
@@ -1226,7 +1233,6 @@ class MainWindow(QMainWindow):
         self.settings["sub_userinfo"] = {}
         self.inp_url.clear()
         self._refresh_sub_userinfo_badge()
-        save_settings(self.settings)
 
     def _show_import_errors(self, errors: List[str]) -> None:
         if errors:
@@ -1249,8 +1255,7 @@ class MainWindow(QMainWindow):
                     node.port_pinned = old.port_pinned
         self.nodes = new_nodes
         self.table_model.set_nodes(self.nodes)
-        self._assign_ports(reset_pinned=not preserve_state)
-        self._update_summary_counters()
+        self._assign_ports(reset_pinned=not preserve_state, replace_unreadable=True)
         if source_label:
             self._notify(source_label, "success")
 
@@ -1429,7 +1434,7 @@ class MainWindow(QMainWindow):
         self._notify(f"已自动筛除失效节点，保留 {kept} 个可用节点", "success")
 
     def _clear_all_nodes(self) -> None:
-        if not self.nodes:
+        if not self.nodes and not nodes_cache_protected():
             return
         if self.xray_mgr.is_running():
             self._notify("代理服务正在运行中，请先停止服务再清空列表", "warning")
@@ -1437,14 +1442,18 @@ class MainWindow(QMainWindow):
         ans = QMessageBox.question(
             self,
             "确认清空",
-            f"确定要清空当前全部 {len(self.nodes)} 个节点吗？",
+            f"确定要清空当前全部 {len(self.nodes)} 个节点吗？" if self.nodes else "确定备份无法读取的缓存并清空吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans == QMessageBox.StandardButton.Yes:
+            result = clear_cached_nodes(replace_unreadable=True)
+            self._report_cache_save(result)
+            if result.error:
+                return
             self._cancel_probes()
             self._clear_subscription_source()
             self.nodes = []
-            clear_cached_nodes()
+            self._report_cache_save(save_settings(self.settings))
             self.table_model.set_nodes(self.nodes)
             self._update_summary_counters()
             self._notify("节点列表已清空", "info")
@@ -1472,8 +1481,12 @@ class MainWindow(QMainWindow):
             menu.addAction("复制原始节点分享链接", lambda: self._copy_text_toast(node.raw_link, "已复制原始分享链接"))
 
         menu.addSeparator()
-        menu.addAction("单独测速此节点", lambda: self._test_single_row_async(src_row))
-        menu.addAction("检测此节点出口 IP", lambda: self._probe_single_exit_ip_async(src_row))
+        menu.addAction("单独测速此节点", lambda: self._test_single_row_async(src_row)).setEnabled(
+            self._speed_task is None,
+        )
+        menu.addAction("检测此节点出口 IP", lambda: self._probe_single_exit_ip_async(src_row)).setEnabled(
+            self._exit_ip_task is None,
+        )
         menu.addAction("修改本地端口...", lambda: self._prompt_edit_port(src_row))
         if node.port_pinned:
             menu.addAction("解除端口锁定", lambda: self._unpin_row_port(src_row))
@@ -1925,11 +1938,12 @@ class MainWindow(QMainWindow):
         )
         if dlg.exec() == ProxySettingsDialog.DialogCode.Accepted:
             en, u, p, t_url = dlg.get_values()
-            self.settings["auth_enabled"] = en
-            self.settings["auth_user"] = u
-            self.settings["auth_pass"] = p
-            self.settings["test_url"] = t_url
-            save_settings(self.settings)
+            settings = dict(self.settings, auth_enabled=en, auth_user=u, auth_pass=p, test_url=t_url)
+            result = save_settings(settings, replace_unreadable=True)
+            self._report_cache_save(result)
+            if result.error:
+                return
+            self.settings = settings
             self._refresh_auth_button_style()
             self._sync_dirty_banner()
             self._notify("参数设置已保存", "success")
@@ -1983,9 +1997,9 @@ class MainWindow(QMainWindow):
             widths[COL_NAME] = 310
         self.settings["column_widths"] = widths
         self.settings["name_col_manual"] = self._manual_name_width is not None
-        save_settings(self.settings)
+        self._report_cache_save(save_settings(self.settings))
         if self.nodes:
-            save_cached_nodes(self.nodes)
+            self._report_cache_save(save_cached_nodes(self.nodes))
 
     def _quit_completely(self) -> None:
         self._force_quit = True
@@ -1997,6 +2011,8 @@ class MainWindow(QMainWindow):
                 if self.tray:
                     self.tray.hide()
                 event.accept()
+                if self._force_quit:
+                    QTimer.singleShot(0, QApplication.quit)
             else:
                 event.ignore()
             return
@@ -2030,12 +2046,6 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._cancel_probes()
         self._save_window_state()
-        if not self._service_busy and self.xray_mgr.process is None and not self.xray_mgr.is_running():
-            self._shutdown_complete = True
-            if self.tray:
-                self.tray.hide()
-            event.accept()
-            return
 
         event.ignore()
         self.setEnabled(False)
@@ -2074,6 +2084,7 @@ def run_gui() -> None:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication.instance() or QApplication(sys.argv)
+    app.aboutToQuit.connect(clear_icon_caches)
     app.setStyle("Fusion")
     base_font = QFont("Microsoft YaHei UI", 9)
     base_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)

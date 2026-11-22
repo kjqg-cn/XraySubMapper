@@ -12,6 +12,8 @@ release/
 # Runtime user configs & sensitive proxy credentials (NEVER commit)
 app_settings.json
 cached_nodes.json
+app_settings.json.*.bak
+cached_nodes.json.*.bak
 xray_config.json
 *.tmp
 *.log

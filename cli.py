@@ -1,5 +1,6 @@
 import argparse
 import ipaddress
+import os
 import signal
 import sys
 import threading
@@ -13,8 +14,10 @@ from core.xray_manager import XrayManager, format_proxy_host
 def run_cli(args: argparse.Namespace) -> None:
     auth_user = getattr(args, "auth_user", None)
     auth_pass = getattr(args, "auth_pass", None)
+    if auth_user and auth_pass is None:
+        auth_pass = os.environ.get("XRAY_AUTH_PASS")
     if (auth_user is not None or auth_pass is not None) and not (auth_user and auth_pass):
-        print("[-] 请同时提供非空的 --auth-user 和 --auth-pass")
+        print("[-] 请提供 --auth-user 和 --auth-pass（也可通过 XRAY_AUTH_PASS 设置密码）")
         sys.exit(1)
 
     content = ""
@@ -79,8 +82,8 @@ def run_cli(args: argparse.Namespace) -> None:
         print(f"{idx + 1:<4} {node.protocol.upper():<10} {proxy_addr:<28} {node.name}")
     print("=" * 72 + "\n")
 
-    mgr = XrayManager()
     stopping = threading.Event()
+    mgr = XrayManager(cancel_event=stopping)
     interrupted = False
 
     def _sig_handler(sig, frame):
@@ -91,13 +94,15 @@ def run_cli(args: argparse.Namespace) -> None:
 
     handlers = {}
     try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            handlers[sig] = signal.signal(sig, _sig_handler)
         ok, msg = mgr.start(active_nodes, listen_ip, auth_user=auth_user or "", auth_pass=auth_pass or "")
+        if stopping.is_set():
+            return
         if not ok:
             print(f"[-] 启动 Xray 失败: {msg}")
             sys.exit(1)
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            handlers[sig] = signal.signal(sig, _sig_handler)
         print(f"[+] Xray 混合代理已启动 (监听 {listen_ip}，端口 {start_p} ~ {start_p + len(active_nodes) - 1})")
 
         export_candidates = active_nodes
@@ -137,7 +142,7 @@ def run_cli(args: argparse.Namespace) -> None:
         stopping.set()
     finally:
         try:
-            ok, msg = mgr.stop()
+            ok, msg = mgr.close()
             if stopping.is_set():
                 print(f"\n{'[+]' if ok else '[-]'} {msg}")
         finally:

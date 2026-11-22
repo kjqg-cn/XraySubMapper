@@ -1,12 +1,46 @@
 import base64
 import gzip
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import ModuleType
 
 import pytest
 import requests
 
 from core import subscription
+
+
+@pytest.mark.parametrize("proxy_error", ["missing-socks", "bad-socks", "invalid-proxy-url"])
+def test_broken_system_proxy_retries_without_proxy(monkeypatch, proxy_error):
+    attempts = []
+    socks = ModuleType("socks")
+    errors = {
+        "missing-socks": requests.exceptions.InvalidSchema("Missing dependencies for SOCKS support."),
+        "bad-socks": AttributeError("PySocks API unavailable", name="PROXY_TYPE_SOCKS5", obj=socks),
+        "invalid-proxy-url": requests.exceptions.InvalidProxyURL("Missing proxy host"),
+    }
+
+    def send(self, request, **kwargs):
+        attempts.append(self.trust_env)
+        if self.trust_env:
+            raise errors[proxy_error]
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"trojan://fake@example.com:443"
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.Session, "send", send)
+    content, _ = subscription.fetch_subscription_with_meta("http://example.com/sub")
+    assert content == "trojan://fake@example.com:443" and attempts == [True, False]
+
+
+def test_millisecond_and_second_subscription_expiries_are_equivalent():
+    seconds = 1798761600
+    expected = subscription.parse_subscription_userinfo(f"expire={seconds}")
+    assert expected["summary"] == f"{datetime.fromtimestamp(seconds):%Y-%m-%d} 到期"
+    assert subscription.parse_subscription_userinfo(f"expire={seconds * 1000 + 123}") == expected
 
 
 @pytest.mark.parametrize("encoded", [False, True])

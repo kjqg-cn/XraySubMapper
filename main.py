@@ -44,7 +44,7 @@ def main() -> None:
     parser.add_argument("--listen", type=str, default="127.0.0.1", help="本地监听 IP (默认: 127.0.0.1，局域网共享可用 0.0.0.0)")
     parser.add_argument("--max-nodes", type=int, default=0, help="最大映射节点数量 (0 表示不限制)")
     parser.add_argument("--auth-user", help="本地代理鉴权用户名，与 --auth-pass 一起使用")
-    parser.add_argument("--auth-pass", help="本地代理鉴权密码，与 --auth-user 一起使用")
+    parser.add_argument("--auth-pass", help="本地代理鉴权密码，省略时读取 XRAY_AUTH_PASS")
     parser.add_argument("--test", action="store_true", help="启动后自动进行连通性与延时测速")
     parser.add_argument("--export", type=str, help="将生成的代理列表导出为文本文件")
     parser.add_argument("--gui", action="store_true", help="强制启动图形界面")

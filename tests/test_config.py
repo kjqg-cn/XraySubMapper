@@ -1,5 +1,7 @@
+import base64
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -112,6 +114,50 @@ def test_partially_unreadable_cache_preserves_incompatible_records(cache_paths, 
     with pytest.warns(RuntimeWarning, match="阻止覆盖"):
         config.save_cached_nodes([make_node("new")])
     assert path.read_bytes() == original
+    result = config.save_cached_nodes([make_node("new")], replace_unreadable=True)
+    assert not result.error and Path(result.backup_path).read_bytes() == original
+    assert config.save_cached_nodes([make_node("newer")]) == config.CacheSaveResult()
+    assert config.load_cached_nodes()[0].name == "newer"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+@pytest.mark.parametrize("original", [
+    b'[{"password": "legacy-fixture"',
+    b'{"format":"dpapi-v1","data":"broken","password":"legacy-fixture"}',
+])
+def test_explicit_clear_preserves_unreadable_legacy_bytes_encrypted(cache_paths, original):
+    path = cache_paths[1]
+    path.write_bytes(original)
+    with pytest.warns(RuntimeWarning, match="无法读取"):
+        assert config.load_cached_nodes() == []
+    assert config.nodes_cache_protected()
+    result = config.clear_cached_nodes(replace_unreadable=True)
+    assert not result.error
+    backup = Path(result.backup_path).read_bytes()
+    assert b"legacy-fixture" not in backup
+    envelope = json.loads(backup)
+    assert config._crypt_data(base64.b64decode(envelope["data"]), protect=False) == original
+    assert not config.nodes_cache_protected()
+    assert config.load_cached_nodes() == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+def test_explicit_save_keeps_original_when_backup_fails(cache_paths, monkeypatch):
+    path = cache_paths[0]
+    original = b'{"auth_pass": "legacy-fixture"'
+    path.write_bytes(original)
+    with pytest.warns(RuntimeWarning, match="无法读取"):
+        restored = config.load_settings()
+
+    def fail_backup(file_path):
+        raise OSError("backup failed")
+
+    monkeypatch.setattr(config, "_backup_cache", fail_backup)
+    with pytest.warns(RuntimeWarning, match="backup failed"):
+        result = config.save_settings(restored, replace_unreadable=True)
+    assert "backup failed" in result.error
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob("*.tmp"))
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")

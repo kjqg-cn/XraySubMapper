@@ -56,6 +56,8 @@ def parse_subscription_userinfo(header_val: str) -> Dict[str, Any]:
     used = info.get("upload", 0) + info.get("download", 0)
     total = info.get("total", 0)
     expire = info.get("expire", 0)
+    if expire >= 10**12:
+        expire //= 1000
 
     def _fmt_bytes(b: int) -> str:
         gb = b / (1024 ** 3)
@@ -75,7 +77,7 @@ def parse_subscription_userinfo(header_val: str) -> Dict[str, Any]:
         try:
             dt = datetime.fromtimestamp(expire).strftime("%Y-%m-%d")
             parts.append(f"{dt} 到期")
-        except Exception:
+        except (OSError, OverflowError, ValueError):
             pass
 
     return {
@@ -126,8 +128,15 @@ def fetch_subscription_with_meta(
                     and requests.utils.select_proxy(response.url, requests.utils.get_environ_proxies(response.url))):
                 continue
             raise
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        except (
+            requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+            requests.exceptions.InvalidSchema, requests.exceptions.InvalidURL,
+        ):
             if not trust_env:
+                raise
+        except AttributeError as exc:
+            # An incompatible socks module can satisfy urllib3's import without exposing PySocks APIs.
+            if not trust_env or getattr(exc.obj, "__name__", "") != "socks":
                 raise
 
 

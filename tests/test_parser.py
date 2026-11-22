@@ -70,11 +70,32 @@ def test_removed_tls_option_is_rejected_at_import(text):
 
 @pytest.mark.parametrize("text", [
     "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@example.com:9443/?plugin=v2ray-plugin%3Bmode%3Dwebsocket",
+    "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@example.com:9443/?%50lugin=v2ray-plugin",
+    "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@example.com:9443/?PLUGIN=",
     "proxies:\n  - {name: plugin, type: ss, server: example.com, port: 9443, cipher: aes-128-gcm, password: test, plugin: v2ray-plugin}",
 ])
 def test_unsupported_ss_plugins_are_not_silently_accepted(text):
     nodes, errors = parse_subscription_content(text)
     assert not nodes and any("plugin" in error for error in errors)
+
+
+@pytest.mark.parametrize("text", [
+    f"vless://{UUID}@example.com:",
+    "trojan://password@example.com:",
+    "vless://@example.com:443",
+    "proxies: [{type: ss, server: example.com, port: 8388, cipher: null}]",
+    "proxies: [{type: trojan, server: example.com, port: bad, password: testing}]",
+    "proxies: [{type: trojan, server: example.com, port: 1.5, password: testing}]",
+])
+def test_invalid_ports_and_required_fields_are_reported_at_import(text):
+    nodes, errors = parse_subscription_content(text)
+    assert not nodes and len(errors) == 1
+
+
+def test_empty_clash_http_opts_leaves_plain_tcp():
+    proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "network": "tcp", "http-opts": {}}
+    stream = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]
+    assert stream["network"] == "tcp" and "tcpSettings" not in stream
 
 
 def test_clash_xhttp_fields_survive_cache_roundtrip():

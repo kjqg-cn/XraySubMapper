@@ -1,10 +1,13 @@
 import copy
 import ctypes
+import errno
 import json
 import os
 import re
+import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -12,6 +15,7 @@ import time
 import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -26,6 +30,14 @@ MIN_XRAY_VERSION = (26, 11, 9)
 _MIN_VERSION_TEXT = ".".join(map(str, MIN_XRAY_VERSION))
 _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 _POLL_INTERVAL = 0.025
+_LISTENER_PROBE_BATCH = 256  # Winsock select() limits the number of sockets per set.
+_ERROR_INSUFFICIENT_BUFFER = 122
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+_UDP_TABLE_OWNER_PID = 1
+_CONNECT_PENDING = {
+    errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR,
+    getattr(errno, "WSAEWOULDBLOCK", errno.EWOULDBLOCK),
+}
 
 
 def _close_job(job: int) -> None:
@@ -140,11 +152,77 @@ def format_proxy_host(listen_ip: str) -> str:
     return f"[{host}]" if ":" in host else host
 
 
-def _can_connect(host: str, port: int, timeout: float) -> bool:
+def _ready_tcp_ports(host: str, ports: List[int], timeout: float) -> set[int]:
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        return sock.connect_ex((host, port)) == 0
+    ready = set()
+    with ExitStack() as sockets:
+        connecting = {}
+        for port in ports:
+            try:
+                sock = sockets.enter_context(socket.socket(family, socket.SOCK_STREAM))
+                sock.setblocking(False)
+                status = sock.connect_ex((host, port))
+                if status == 0:
+                    ready.add(port)
+                elif status in _CONNECT_PENDING:
+                    connecting[sock] = port
+            except OSError:
+                continue
+
+        deadline = time.monotonic() + timeout
+        while connecting:
+            try:
+                _, writable, failed = select.select([], connecting, connecting, max(0.0, deadline - time.monotonic()))
+            except OSError:
+                break
+            if not writable and not failed:
+                break
+            for sock in failed:
+                connecting.pop(sock, None)
+            for sock in writable:
+                port = connecting.pop(sock, None)
+                try:
+                    if port is not None and sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                        ready.add(port)
+                except OSError:
+                    continue
+            if time.monotonic() >= deadline:
+                break
+    return ready
+
+
+def _windows_foreign_listener_ports(exclude_pid: int) -> set[int]:
+    ip_helper = ctypes.windll.iphlpapi
+    # MIB_*ROW_OWNER_PID layouts, retaining dwLocalPort and dwOwningPid.
+    tables = (
+        (ip_helper.GetExtendedTcpTable, _TCP_TABLE_OWNER_PID_LISTENER, socket.AF_INET, "8xI8xI"),
+        (ip_helper.GetExtendedTcpTable, _TCP_TABLE_OWNER_PID_LISTENER, socket.AF_INET6, "20xI28xI"),
+        (ip_helper.GetExtendedUdpTable, _UDP_TABLE_OWNER_PID, socket.AF_INET, "4xII"),
+        (ip_helper.GetExtendedUdpTable, _UDP_TABLE_OWNER_PID, socket.AF_INET6, "20xII"),
+    )
+    dword = ctypes.c_uint32
+    ports = set()
+    for get_table, table_class, family, row_format in tables:
+        get_table.argtypes = [ctypes.c_void_p, ctypes.POINTER(dword), ctypes.c_int, dword, ctypes.c_int, dword]
+        get_table.restype = dword
+        size = dword()
+        data = None
+        for _ in range(4):  # A socket may open between reading the size and filling the buffer.
+            error = get_table(data, ctypes.byref(size), False, family, table_class, 0)
+            if error != _ERROR_INSUFFICIENT_BUFFER:
+                break
+            data = ctypes.create_string_buffer(size.value)
+        if error:
+            raise ctypes.WinError(error)
+        if data is None:
+            continue
+        row = struct.Struct("=" + row_format)
+        count, = struct.unpack_from("=I", data)
+        end = ctypes.sizeof(dword) + count * row.size
+        for port, pid in row.iter_unpack(memoryview(data)[ctypes.sizeof(dword):end]):
+            if pid != exclude_pid:
+                ports.add(socket.ntohs(port & 0xFFFF))
+    return ports
 
 
 def _local_proxy_error(exc: Exception) -> str:
@@ -157,7 +235,7 @@ def _local_proxy_error(exc: Exception) -> str:
 
 
 class XrayManager:
-    def __init__(self, xray_path: Optional[str] = None):
+    def __init__(self, xray_path: Optional[str] = None, *, cancel_event: Optional[threading.Event] = None):
         self.xray_path = xray_path or self._find_xray_executable()
         self.process: Optional[subprocess.Popen] = None
         self.log_callback: Optional[Callable[[str], None]] = None
@@ -170,6 +248,7 @@ class XrayManager:
         self._lifecycle_lock = threading.RLock()
         self._stop_lock = threading.Lock()
         self._stop_requested = threading.Event()
+        self._cancel_event = cancel_event
         self._closed = False
         self._version_cache = None
         self._active_nodes: List[ProxyNode] = []
@@ -213,14 +292,6 @@ class XrayManager:
     def check_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         """Check the TCP and UDP sockets required by a mixed inbound."""
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        # 1. Active TCP connect probe catches non-exclusive binds on Windows
-        try:
-            if _can_connect(_connect_host(host), port, 0.15):
-                return True
-        except OSError:
-            return True
-
-        # 2. Exclusive bind test on target listen address
         for sock_type in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             try:
                 with socket.socket(family, sock_type) as sock:
@@ -234,7 +305,7 @@ class XrayManager:
     @staticmethod
     def validate_node_ports(
         nodes: List[ProxyNode], listen_ip: str = "127.0.0.1", owned_ports: Optional[set] = None,
-        stop_requested: Optional[threading.Event] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> Tuple[bool, str]:
         """Validate port range, internal duplicates, and external port conflicts."""
         active_nodes = [n for n in nodes if n.enabled]
@@ -243,7 +314,7 @@ class XrayManager:
 
         seen_ports: Dict[int, str] = {}
         for n in active_nodes:
-            if stop_requested is not None and stop_requested.is_set():
+            if cancelled is not None and cancelled():
                 return False, "端口校验已取消"
             if not (1 <= n.local_port <= 65535):
                 return False, f"节点 [{n.name}] 的本地端口 ({n.local_port}) 无效，须在 1~65535 之间。"
@@ -257,7 +328,7 @@ class XrayManager:
 
         conflict_ports = []
         for n in active_nodes:
-            if stop_requested is not None and stop_requested.is_set():
+            if cancelled is not None and cancelled():
                 return False, "端口校验已取消"
             if owned_ports and n.local_port in owned_ports:
                 continue
@@ -339,13 +410,16 @@ class XrayManager:
         }
 
     def _resolved_xray_path(self) -> str:
-        path = shutil.which(self.xray_path)
+        path = self.xray_path if os.path.isfile(self.xray_path) else shutil.which(self.xray_path)
         if not path:
             raise FileNotFoundError(f"未找到 Xray 内核可执行文件: {self.xray_path}")
         return os.path.realpath(path)
 
+    def _is_cancelled(self) -> bool:
+        return self._stop_requested.is_set() or (self._cancel_event is not None and self._cancel_event.is_set())
+
     def _run_preflight(self, command: List[str], payload: Optional[str] = None) -> Tuple[int, str]:
-        if self._stop_requested.is_set():
+        if self._is_cancelled():
             raise InterruptedError("Xray 校验已取消")
         proc = subprocess.Popen(
             command, stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
@@ -368,17 +442,26 @@ class XrayManager:
                 done.set()
 
         # Windows pipe writes may block before communicate() reaches its timeout.
+        worker = threading.Thread(target=communicate, daemon=True)
         try:
-            threading.Thread(target=communicate, daemon=True).start()
+            worker.start()
+        except RuntimeError:
+            with proc:
+                proc.kill()
+            raise
+        try:
             deadline = time.monotonic() + 10
             while not done.wait(_POLL_INTERVAL):
-                if self._stop_requested.is_set():
+                if self._is_cancelled():
                     raise InterruptedError("Xray 校验已取消")
                 if time.monotonic() >= deadline:
                     raise subprocess.TimeoutExpired(command, 10)
         finally:
-            if not done.is_set():
-                _terminate_process(proc)
+            try:
+                if not done.is_set():
+                    proc.kill()
+            finally:
+                worker.join(timeout=2.0)
         if errors:
             raise errors[0]
         return result[0]
@@ -426,7 +509,7 @@ class XrayManager:
     ) -> Tuple[bool, str]:
         """Start Xray and wait until the mapped ports accept connections."""
         with self._lifecycle_lock:
-            if self._stop_requested.is_set():
+            if self._is_cancelled():
                 return False, "启动已取消"
             if self.is_running():
                 return False, "代理服务已在运行中。"
@@ -442,7 +525,7 @@ class XrayManager:
         self, nodes: List[ProxyNode], listen_ip: str, auth_user: str, auth_pass: str,
         owned_ports: Optional[set] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports, self._stop_requested)
+        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports, self._is_cancelled)
         if not ok:
             return False, err, {}
         try:
@@ -458,7 +541,7 @@ class XrayManager:
         self, config: Dict[str, Any], active_nodes: List[ProxyNode],
         listen_ip: str, auth_user: str, auth_pass: str,
     ) -> Tuple[bool, str]:
-        if self._stop_requested.is_set():
+        if self._is_cancelled():
             return False, "启动已取消"
         payload = json.dumps(config, ensure_ascii=False)
         proc = None
@@ -511,31 +594,31 @@ class XrayManager:
             threading.Thread(target=write_config, args=(proc.stdin,), daemon=True).start()
 
             host = _connect_host(listen_ip)
-            pending = {node.local_port for node in active_nodes}
+            pending = deque(node.local_port for node in active_nodes)
             deadline = time.monotonic() + 5
             while pending:
-                if self._stop_requested.is_set():
+                if self._is_cancelled():
                     raise InterruptedError("启动已取消")
                 if write_errors:
                     raise write_errors[0]
                 if proc.poll() is not None:
                     raise RuntimeError(f"Xray 启动后退出 (code={proc.returncode})")
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     ports = ", ".join(str(port) for port in sorted(pending)[:6])
                     raise TimeoutError(f"等待 Xray 监听超时，仍有 {len(pending)} 个端口未就绪（{ports}）")
-                if written.is_set():
-                    for port in tuple(pending):
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0 or self._stop_requested.is_set():
-                            break
-                        if _can_connect(host, port, min(remaining, _POLL_INTERVAL)):
-                            pending.remove(port)
-                if pending:
+                if not written.is_set():
+                    self._stop_requested.wait(_POLL_INTERVAL)
+                    continue
+                batch = [pending.popleft() for _ in range(min(len(pending), _LISTENER_PROBE_BATCH))]
+                ready = _ready_tcp_ports(host, batch, min(remaining, _POLL_INTERVAL))
+                pending.extend(port for port in batch if port not in ready)
+                if pending and not ready and len(pending) == len(batch):
                     self._stop_requested.wait(_POLL_INTERVAL)
 
             if proc.poll() is not None:
                 raise RuntimeError(f"Xray 启动后退出 (code={proc.returncode})")
-            if self._stop_requested.is_set():
+            if self._is_cancelled():
                 raise InterruptedError("启动已取消")
 
             mappings = [
@@ -575,7 +658,7 @@ class XrayManager:
     ) -> Tuple[bool, str]:
         """Validate first, restart, and restore the previous service if switching fails."""
         with self._lifecycle_lock:
-            if self._stop_requested.is_set():
+            if self._is_cancelled():
                 return False, "重载已取消"
             active_nodes = copy.deepcopy([n for n in nodes if n.enabled])
             was_running = self.is_running()
@@ -587,10 +670,19 @@ class XrayManager:
             )
             if was_running and shared_bind:
                 owned_ports = {n.local_port for n in self._active_nodes}
+            reused = owned_ports.intersection(n.local_port for n in active_nodes)
+            if sys.platform == "win32" and reused and listen_ip in ("0.0.0.0", "::") and listen_ip != self.listen_ip:
+                try:
+                    conflicts = reused & _windows_foreign_listener_ports(self.process.pid)
+                except OSError as exc:
+                    return False, f"无法核对通配监听地址的端口占用: {exc}"
+                if conflicts:
+                    ports = ", ".join(map(str, sorted(conflicts)[:6]))
+                    return False, f"其他程序已占用 {len(conflicts)} 个待复用端口（{ports}）"
             ok, msg, config = self._prepare_config(active_nodes, listen_ip, auth_user, auth_pass, owned_ports)
             if not ok:
                 return False, msg
-            if self._stop_requested.is_set():
+            if self._is_cancelled():
                 return False, "重载已取消"
 
             previous = (self._active_config, self._active_nodes, self.listen_ip, self.auth_credentials)
@@ -599,7 +691,7 @@ class XrayManager:
                 if not ok:
                     return False, msg
             ok, msg = self._launch(config, active_nodes, listen_ip, auth_user, auth_pass)
-            if ok or not was_running or self._stop_requested.is_set():
+            if ok or not was_running or self._is_cancelled():
                 return ok, msg
             old_config, old_nodes, old_ip, old_auth = previous
             restored, restore_msg = self._launch(old_config, old_nodes, old_ip, *(old_auth or ("", "")))

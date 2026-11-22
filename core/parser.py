@@ -2,7 +2,7 @@ import base64
 import json
 import re
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, parse_qsl, unquote, urlparse
+from urllib.parse import ParseResult, parse_qsl, unquote, urlparse
 
 
 DUMMY_SERVERS = {"", "127.0.0.1", "0.0.0.0", "localhost", "1.1.1.1", "8.8.8.8", "::1"}
@@ -58,14 +58,19 @@ def safe_b64decode(s: str) -> str:
         return base64.b64decode(s.encode("utf-8")).decode("utf-8", errors="ignore")
 
 
+def _authority_port(parsed: ParseResult, default_port: int) -> int:
+    if parsed.netloc.endswith(":"):
+        raise ValueError("Missing proxy port")
+    port = parsed.port
+    return default_port if port is None else port
+
+
 def _split_host_port(host_port: str, default_port: int = 443) -> Tuple[str, int]:
     """Safely split host:port including bracketed IPv6 like [2001:db8::1]:8388."""
     parsed = urlparse("//" + host_port.strip())
     if not parsed.hostname or parsed.path not in ("", "/"):
         raise ValueError("Invalid proxy host/port")
-    if parsed.netloc.endswith(":"):
-        raise ValueError("Missing proxy port")
-    port = parsed.port if parsed.port is not None else default_port
+    port = _authority_port(parsed, default_port)
     if not 1 <= port <= 65535:
         raise ValueError("Proxy port must be in 1..65535")
     return parsed.hostname, port
@@ -326,6 +331,8 @@ class VLESSNode(ProxyNode):
         raw_link: str = "",
     ):
         super().__init__(name, "vless", server, port, raw_link)
+        if self.enabled and not str(uuid or "").strip():
+            raise ValueError("VLESS 缺少 UUID")
         self.uuid = uuid
         self.flow = flow or ""
         self.encryption = encryption or "none"
@@ -531,7 +538,9 @@ class TrojanNode(ProxyNode):
 class ShadowsocksNode(ProxyNode):
     def __init__(self, name: str, server: str, port: int, method: str, password: str, raw_link: str = ""):
         super().__init__(name, "shadowsocks", server, port, raw_link)
-        self.method = method
+        self.method = str(method or "").strip()
+        if self.enabled and not self.method:
+            raise ValueError("Shadowsocks 缺少加密方式 (method / cipher)")
         self.password = password
 
     def to_dict(self) -> Dict[str, Any]:
@@ -739,7 +748,7 @@ def parse_vless(link: str) -> VLESSNode:
     u = urlparse(link)
     uuid = unquote(u.username or "")
     server = u.hostname or ""
-    port = 443 if u.port is None else u.port
+    port = _authority_port(u, 443)
     name = unquote(u.fragment) if u.fragment else f"vless-{server}:{port}"
     params = _parse_share_query(u.query)
 
@@ -778,7 +787,7 @@ def parse_trojan(link: str) -> TrojanNode:
     userinfo, separator, _ = u.netloc.rpartition("@")
     password = unquote(userinfo) if separator else ""
     server = u.hostname or ""
-    port = 443 if u.port is None else u.port
+    port = _authority_port(u, 443)
     name = unquote(u.fragment) if u.fragment else f"trojan-{server}:{port}"
     params = _parse_share_query(u.query)
 
@@ -821,7 +830,7 @@ def parse_ss(link: str) -> ShadowsocksNode:
     body = main_part[5:].strip()
     if "?" in body:
         body, query = body.split("?", 1)
-        if "plugin" in parse_qs(query, keep_blank_values=True):
+        if any(key.lower() == "plugin" for key, _ in parse_qsl(query, keep_blank_values=True)):
             raise ValueError("不支持 Shadowsocks 插件节点 (plugin)")
 
     if "@" in body:
@@ -969,7 +978,7 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
             host = h2_hosts
 
     http_opts = p.get("http-opts")
-    if isinstance(http_opts, dict):
+    if network in ("tcp", "raw") and isinstance(http_opts, dict) and http_opts:
         header_type = "http"
         paths = http_opts.get("path")
         if isinstance(paths, list) and paths:
@@ -1032,7 +1041,15 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
     ptype = str(p.get("type", "")).lower()
     name = str(p.get("name", "")).strip()
     server = str(p.get("server", "")).strip()
-    port = _safe_int(p.get("port"), 443)
+    port_value = p.get("port", 443)
+    if isinstance(port_value, bool) or not isinstance(port_value, (int, str)):
+        raise ValueError("Clash port 须为 0~65535 的整数")
+    try:
+        port = int(port_value)
+    except ValueError:
+        raise ValueError("Clash port 须为 0~65535 的整数") from None
+    if not 0 <= port <= 65535:
+        raise ValueError("Clash port 须为 0~65535 的整数")
     if ptype in ("vmess", "vless", "trojan"):
         tr = _extract_clash_transport(p)
 
@@ -1063,7 +1080,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             name=name,
             server=server,
             port=port,
-            uuid=str(p.get("uuid", "")),
+            uuid=str(p.get("uuid") or ""),
             flow=str(p.get("flow") or ""),
             network=tr["network"],
             header_type=tr["header_type"],
@@ -1105,7 +1122,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             name=name,
             server=server,
             port=port,
-            method=str(p.get("cipher", "")),
+            method=str(p.get("cipher") or ""),
             password=str(p.get("password", "")),
         )
     if ptype in ("socks", "socks5"):

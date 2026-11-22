@@ -6,6 +6,8 @@ import sys
 import tempfile
 import threading
 import warnings
+from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any, Dict, List, Set
 
 
@@ -21,6 +23,12 @@ CONFIG_FILE = os.path.join(BASE_DIR, "app_settings.json")
 NODES_CACHE_FILE = os.path.join(BASE_DIR, "cached_nodes.json")
 _WRITE_LOCK = threading.Lock()
 _UNREADABLE_FILES: Set[str] = set()
+
+
+@dataclass(frozen=True)
+class CacheSaveResult:
+    error: str = ""
+    backup_path: str = ""
 
 
 def _crypt_data(data: bytes, protect: bool) -> bytes:
@@ -88,14 +96,52 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 
-def _atomic_write_json(file_path: str, payload: Any) -> None:
+def _protect_bytes(raw: bytes) -> dict:
+    encrypted = _crypt_data(raw, protect=True)
+    return {"format": "dpapi-v1", "data": base64.b64encode(encrypted).decode("ascii")}
+
+
+def _backup_cache(file_path: str) -> str:
+    with open(file_path, "rb") as source:
+        raw = source.read()
+    try:
+        envelope = json.loads(raw)
+        protected = (
+            isinstance(envelope, dict)
+            and envelope.keys() == {"format", "data"}
+            and envelope["format"] == "dpapi-v1"
+            and bool(base64.b64decode(envelope["data"], validate=True))
+        )
+    except (ValueError, TypeError, RecursionError):
+        protected = False
+    if not protected:
+        raw = json.dumps(_protect_bytes(raw)).encode("utf-8")
+
+    backup_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=os.path.dirname(file_path), prefix=f"{os.path.basename(file_path)}.",
+            suffix=".bak", delete=False,
+        ) as backup:
+            backup_path = backup.name
+            backup.write(raw)
+            backup.flush()
+            os.fsync(backup.fileno())
+        return backup_path
+    except Exception:
+        if backup_path is not None:
+            with suppress(OSError):
+                os.unlink(backup_path)
+        raise
+
+
+def _atomic_write_json(file_path: str, payload: Any, *, replace_unreadable: bool = False) -> str:
     key = os.path.normcase(os.path.abspath(file_path))
     with _WRITE_LOCK:
-        if key in _UNREADABLE_FILES and os.path.exists(file_path):
-            raise OSError("原缓存读取失败，已阻止覆盖；请先备份原文件并恢复原账户或缓存文件")
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        encrypted = _crypt_data(raw, protect=True)
-        envelope = {"format": "dpapi-v1", "data": base64.b64encode(encrypted).decode("ascii")}
+        protected = key in _UNREADABLE_FILES and os.path.exists(file_path)
+        if protected and not replace_unreadable:
+            raise OSError("原缓存已受保护，已阻止覆盖。可通过主动导入、清空或保存设置替换")
+        envelope = _protect_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         tmp_path = None
         try:
@@ -107,7 +153,10 @@ def _atomic_write_json(file_path: str, payload: Any) -> None:
                 json.dump(envelope, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
+            backup_path = _backup_cache(file_path) if protected else ""
             os.replace(tmp_path, file_path)
+            _UNREADABLE_FILES.discard(key)
+            return backup_path
         finally:
             if tmp_path is not None and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -125,20 +174,30 @@ def load_settings() -> Dict[str, Any]:
     return res
 
 
-def save_settings(settings: Dict[str, Any]) -> None:
+def _save_cache(file_path: str, payload: Any, action: str, replace_unreadable: bool) -> CacheSaveResult:
     try:
-        _atomic_write_json(CONFIG_FILE, settings)
+        return CacheSaveResult(backup_path=_atomic_write_json(
+            file_path, payload, replace_unreadable=replace_unreadable,
+        ))
     except Exception as exc:
-        warnings.warn(f"设置保存失败（未回退为明文）: {exc}", RuntimeWarning)
+        message = f"{action}失败（未回退为明文）: {exc}"
+        warnings.warn(message, RuntimeWarning)
+        return CacheSaveResult(error=message)
 
 
-def save_cached_nodes(nodes: List[Any]) -> None:
+def save_settings(settings: Dict[str, Any], *, replace_unreadable: bool = False) -> CacheSaveResult:
+    return _save_cache(CONFIG_FILE, settings, "设置保存", replace_unreadable)
+
+
+def save_cached_nodes(nodes: List[Any], *, replace_unreadable: bool = False) -> CacheSaveResult:
     """Save parsed/mapped nodes to cached_nodes.json."""
     try:
         data = [n.to_dict() for n in nodes if hasattr(n, "to_dict")]
-        _atomic_write_json(NODES_CACHE_FILE, data)
     except Exception as exc:
-        warnings.warn(f"节点缓存保存失败（未回退为明文）: {exc}", RuntimeWarning)
+        message = f"节点缓存序列化失败: {exc}"
+        warnings.warn(message, RuntimeWarning)
+        return CacheSaveResult(error=message)
+    return _save_cache(NODES_CACHE_FILE, data, "节点缓存保存", replace_unreadable)
 
 
 def load_cached_nodes() -> List[Any]:
@@ -168,9 +227,12 @@ def load_cached_nodes() -> List[Any]:
     return []
 
 
-def clear_cached_nodes() -> None:
+def nodes_cache_protected() -> bool:
+    with _WRITE_LOCK:
+        return (os.path.normcase(os.path.abspath(NODES_CACHE_FILE)) in _UNREADABLE_FILES
+                and os.path.exists(NODES_CACHE_FILE))
+
+
+def clear_cached_nodes(*, replace_unreadable: bool = False) -> CacheSaveResult:
     """Clear the cached nodes by saving an empty list."""
-    try:
-        _atomic_write_json(NODES_CACHE_FILE, [])
-    except Exception as exc:
-        warnings.warn(f"节点缓存清空失败: {exc}", RuntimeWarning)
+    return _save_cache(NODES_CACHE_FILE, [], "节点缓存清空", replace_unreadable)

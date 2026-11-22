@@ -68,6 +68,7 @@
 
 ### 方式三：命令行自动化模式（CLI）
 CLI 通过源码入口 `python main.py` 运行。单文件便携版 EXE 提供桌面 GUI。
+设置 `XRAY_AUTH_PASS` 环境变量后，可以只传 `--auth-user`。显式传入的 `--auth-pass` 优先。
 
 ```bash
 # 从订阅链接下载并从 10800 端口开始映射
@@ -138,6 +139,7 @@ XraySubMapper/
 └── tests/
     ├── test_flow.py         # 协议解析与进程生命周期集成测试
     ├── test_parser.py       # 协议参数与编码边界回归
+    ├── test_subscription.py # 订阅下载限制、代理回退与解析
     ├── test_manager.py      # 生命周期、回退与探测一致性
     ├── test_config.py       # 敏感缓存加密及迁移
     ├── test_cli.py          # 测速导出回归
