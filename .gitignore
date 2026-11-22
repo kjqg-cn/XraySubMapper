@@ -19,3 +19,5 @@ xray_config.json
 # External Xray kernel binary (download from XTLS/Xray-core Releases)
 xray.exe
 xray
+
+code-review/
