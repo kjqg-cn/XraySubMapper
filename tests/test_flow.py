@@ -4,7 +4,6 @@ import os
 import shutil
 import socket
 import sys
-import time
 
 import pytest
 
@@ -116,7 +115,6 @@ proxies:
     assert ok, f"启动失败: {msg}"
     assert mgr.is_running(), "Xray 进程未运行"
 
-    time.sleep(0.5)
     for i in range(3):
         test_p = 19810 + i
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -128,7 +126,6 @@ proxies:
         n.local_port = 19820 + i
     r_ok, r_msg = mgr.reload(nodes, "127.0.0.1")
     assert r_ok, f"热重载失败: {r_msg}"
-    time.sleep(0.4)
 
     # Verify SOCKS5 handshake on port 19820
     with socket.create_connection(("127.0.0.1", 19820), timeout=2.0) as s:

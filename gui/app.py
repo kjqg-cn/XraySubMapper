@@ -4,6 +4,7 @@ import sys
 import threading
 import warnings
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -21,7 +22,6 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -50,7 +50,7 @@ from core.config import (
 )
 from core.parser import ProxyNode
 from core.subscription import fetch_subscription_with_meta, parse_subscription_content
-from core.xray_manager import XrayManager
+from core.xray_manager import XrayManager, format_proxy_host
 from .icons import build_app_logo_icon, icon, svg_pixmap
 from .widgets import (
     COL_ENABLED,
@@ -356,13 +356,21 @@ QMenu::separator {
 
 class UiBridge(QObject):
     logReceived = Signal(str)
-    fetchSucceeded = Signal(str, object, object, object)
-    fetchFailed = Signal(str)
+    fetchFinished = Signal(object, str, object, str)
     serviceTransitioned = Signal(bool, str, str)
     speedProgress = Signal(int, int, object)
-    speedFinished = Signal()
+    speedFinished = Signal(object, str)
     exitIpProgress = Signal(int, int, object)
-    exitIpFinished = Signal()
+    exitIpFinished = Signal(object, str)
+
+
+@dataclass(frozen=True)
+class ProbeTask:
+    generation: int
+    signature: Tuple
+    nodes: Tuple[ProxyNode, ...]
+    single: bool
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
 
 class MainWindow(QMainWindow):
@@ -377,27 +385,28 @@ class MainWindow(QMainWindow):
             self.settings: Dict[str, Any] = load_settings()
             self.nodes: List[ProxyNode] = load_cached_nodes()
         self.xray_mgr = XrayManager()
-        self._testing_speed = False
-        self._probing_ip = False
+        self._fetch_request: Optional[object] = None
+        self._speed_task: Optional[ProbeTask] = None
+        self._exit_ip_task: Optional[ProbeTask] = None
+        self._closing = False
+        self._shutdown_complete = False
         self._force_quit = False
         self._applied_signature: Optional[Tuple] = None
         self._pending_signature: Optional[Tuple] = None
         self._service_busy = False
-        self._log_lines_count = 0
         self._manual_name_width: Optional[int] = None
         self._resizing_columns_internally = False
 
         self.bridge = UiBridge(self)
         self.bridge.logReceived.connect(self._append_log)
-        self.bridge.fetchSucceeded.connect(self._on_fetch_succeeded)
-        self.bridge.fetchFailed.connect(self._on_fetch_failed)
+        self.bridge.fetchFinished.connect(self._on_fetch_finished)
         self.bridge.serviceTransitioned.connect(self._on_service_transitioned)
         self.bridge.speedProgress.connect(self._on_speed_progress)
         self.bridge.speedFinished.connect(self._on_speed_finished)
         self.bridge.exitIpProgress.connect(self._on_exit_ip_progress)
         self.bridge.exitIpFinished.connect(self._on_exit_ip_finished)
 
-        self.xray_mgr.set_log_callback(lambda msg: self.bridge.logReceived.emit(msg))
+        self.xray_mgr.set_log_callback(lambda msg: self._emit_worker_signal(self.bridge.logReceived, msg))
 
         self._build_ui()
         self._restore_window_bounds()
@@ -483,7 +492,7 @@ class MainWindow(QMainWindow):
         self.btn_settings = QPushButton(" 鉴权与测速")
         self.btn_settings.setIcon(icon("lock", "#475569", 15))
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_settings.setToolTip("配置本地 HTTP 代理访问账号密码及 HTTPS 测速地址")
+        self.btn_settings.setToolTip("配置本地混合代理访问账号密码及 HTTPS 测速地址")
         self.btn_settings.clicked.connect(self._open_settings_dialog)
         header_layout.addWidget(self.btn_settings)
 
@@ -564,13 +573,14 @@ class MainWindow(QMainWindow):
         lbl_listen.setStyleSheet("font-size: 12px; font-weight: bold; color: #334155;")
         row_ctrl.addWidget(lbl_listen)
 
-        cur_ip = str(self.settings.get("listen_ip", "127.0.0.1"))
+        cur_ip = "0.0.0.0" if self.settings.get("listen_ip") == "0.0.0.0" else "127.0.0.1"
+        self.settings["listen_ip"] = cur_ip
         self.combo_listen = MenuSelectButton(
             options=[
                 ("127.0.0.1 (仅本机)", "127.0.0.1", "shield", "#475569"),
                 ("0.0.0.0 (局域网共享)", "0.0.0.0", "globe", "#059669"),
             ],
-            initial_value="0.0.0.0" if cur_ip == "0.0.0.0" else "127.0.0.1",
+            initial_value=cur_ip,
             compact=False,
             parent=self,
         )
@@ -903,7 +913,7 @@ class MainWindow(QMainWindow):
         tray = QSystemTrayIcon(build_app_logo_icon(False), self)
         tray.setToolTip("XraySubMapper · 服务未启动")
 
-        menu = QMenu()
+        menu = QMenu(self)
         act_show = menu.addAction("显示主工作台")
         act_show.triggered.connect(self._bring_to_front)
         self.act_tray_toggle = menu.addAction("启动映射服务")
@@ -924,7 +934,8 @@ class MainWindow(QMainWindow):
             self._bring_to_front()
 
     def _bring_to_front(self) -> None:
-        self.showNormal()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
         self.activateWindow()
         self.raise_()
 
@@ -1006,8 +1017,9 @@ class MainWindow(QMainWindow):
             self.lbl_userinfo.hide()
 
     def _refresh_auth_button_style(self) -> None:
-        if self.settings.get("auth_enabled") and self.settings.get("auth_user"):
-            self.btn_settings.setText(f" 已设鉴权 ({self.settings['auth_user']})")
+        user, _ = self._get_auth_pair()
+        if user:
+            self.btn_settings.setText(f" 已设鉴权 ({user})")
             self.btn_settings.setIcon(icon("shield", "#059669", 15))
         else:
             self.btn_settings.setText(" 鉴权与测速")
@@ -1015,13 +1027,8 @@ class MainWindow(QMainWindow):
 
     def _calc_config_signature(self) -> Tuple:
         listen_ip = str(self.combo_listen.currentData() or "127.0.0.1")
-        auth_t = (
-            bool(self.settings.get("auth_enabled")),
-            str(self.settings.get("auth_user", "")),
-            str(self.settings.get("auth_pass", "")),
-        )
-        enabled_items = tuple((id(n), n.local_port, n.connection_key()) for n in self.nodes if n.enabled)
-        return (listen_ip, auth_t, enabled_items)
+        enabled_items = tuple(sorted((n.local_port, n.connection_key()) for n in self.nodes if n.enabled))
+        return (listen_ip, self._get_auth_pair(), enabled_items)
 
     def _has_unapplied_changes(self) -> bool:
         return self.xray_mgr.is_running() and self._calc_config_signature() != self._applied_signature
@@ -1029,6 +1036,8 @@ class MainWindow(QMainWindow):
     def _sync_dirty_banner(self) -> None:
         if self.xray_mgr.is_running() and self._applied_signature is not None:
             is_dirty = self._has_unapplied_changes()
+            if is_dirty:
+                self._cancel_probes()
             self.btn_reload_dirty.setVisible(is_dirty)
         else:
             self.btn_reload_dirty.hide()
@@ -1044,6 +1053,9 @@ class MainWindow(QMainWindow):
             parts.append(f"可用 {passed}")
         if self.table_model.has_port_conflicts():
             parts.append("端口冲突!")
+        unassigned = sum(1 for n in self.nodes if n.enabled and n.local_port == 0)
+        if unassigned:
+            parts.append(f"{unassigned} 个节点未分配端口")
         self.lbl_stats.setText(" · ".join(parts))
         self.btn_export.setText(f" 复制代理 ({enabled})")
         self._sync_dirty_banner()
@@ -1079,9 +1091,9 @@ class MainWindow(QMainWindow):
             if node.enabled:
                 if node.port_pinned and node.local_port > 0:
                     continue
-                while curr_port in pinned_ports and curr_port < 65535:
+                while curr_port <= 65535 and curr_port in pinned_ports:
                     curr_port += 1
-                node.local_port = min(65535, curr_port)
+                node.local_port = curr_port if curr_port <= 65535 else 0
                 curr_port += 1
             else:
                 if not node.port_pinned:
@@ -1105,7 +1117,7 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.table_model.set_listen_ip(ip)
         self._sync_dirty_banner()
-        if ip == "0.0.0.0" and not self.settings.get("auth_enabled"):
+        if ip == "0.0.0.0" and not all(self._get_auth_pair()):
             self._notify("已切换为 0.0.0.0 局域网共享，建议在右上角开启代理账号密码鉴权", "warning", 3500)
 
     def _on_search_changed(self, text: str) -> None:
@@ -1151,12 +1163,16 @@ class MainWindow(QMainWindow):
         self._notify("已清空历史订阅记录", "info")
 
     def _fetch_subscription_async(self) -> None:
+        if self._closing or self._fetch_request is not None:
+            return
         url = self.inp_url.text().strip()
         if not url:
             self._notify("请先输入或选择订阅链接 URL", "warning")
             self.inp_url.setFocus()
             return
 
+        request = object()
+        self._fetch_request = request
         self.btn_fetch.setEnabled(False)
         self.btn_fetch.setText(" 正在拉取...")
 
@@ -1164,16 +1180,28 @@ class MainWindow(QMainWindow):
             try:
                 content, meta = fetch_subscription_with_meta(url)
                 nodes, errors = parse_subscription_content(content)
-                self.bridge.fetchSucceeded.emit(url, nodes, errors, meta)
             except Exception as exc:
-                self.bridge.fetchFailed.emit(str(exc))
+                self._emit_worker_signal(self.bridge.fetchFinished, request, url, None, str(exc))
+            else:
+                self._emit_worker_signal(self.bridge.fetchFinished, request, url, (nodes, errors, meta), "")
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_fetch_succeeded(self, url: str, nodes: List[ProxyNode], errors: List[str], meta: Dict[str, Any]) -> None:
+    def _reset_fetch(self) -> None:
+        self._fetch_request = None
         self.btn_fetch.setEnabled(True)
         self.btn_fetch.setText(" 下载更新")
 
+    def _on_fetch_finished(self, request: object, url: str, result, error: str) -> None:
+        if self._closing or request is not self._fetch_request:
+            return
+        self._reset_fetch()
+        if self.inp_url.text().strip() != url:
+            return
+        if result is None:
+            QMessageBox.critical(self, "下载订阅失败", f"请求订阅链接时出错：\n{error}")
+            return
+        nodes, errors, meta = result
         if not nodes:
             detail = "\n".join(errors[:3]) if errors else "未识别到支持的节点格式"
             QMessageBox.warning(self, "解析订阅失败", f"未能从订阅中解析出有效节点：\n{detail}")
@@ -1192,10 +1220,13 @@ class MainWindow(QMainWindow):
         self._load_new_nodes(nodes, source_label=f"成功更新订阅 · 导入 {len(nodes)} 个节点", preserve_state=preserve_state)
         self._show_import_errors(errors)
 
-    def _on_fetch_failed(self, err_msg: str) -> None:
-        self.btn_fetch.setEnabled(True)
-        self.btn_fetch.setText(" 下载更新")
-        QMessageBox.critical(self, "下载订阅失败", f"请求订阅链接时出错：\n{err_msg}")
+    def _clear_subscription_source(self) -> None:
+        self._reset_fetch()
+        self.settings["subscription_url"] = ""
+        self.settings["sub_userinfo"] = {}
+        self.inp_url.clear()
+        self._refresh_sub_userinfo_badge()
+        save_settings(self.settings)
 
     def _show_import_errors(self, errors: List[str]) -> None:
         if errors:
@@ -1204,6 +1235,7 @@ class MainWindow(QMainWindow):
     def _load_new_nodes(
         self, new_nodes: List[ProxyNode], source_label: str = "", preserve_state: bool = False,
     ) -> None:
+        self._cancel_probes()
         if preserve_state:
             previous = defaultdict(deque)
             for node in self.nodes:
@@ -1246,6 +1278,7 @@ class MainWindow(QMainWindow):
 
         nodes, errors = parse_subscription_content(cb)
         if nodes:
+            self._clear_subscription_source()
             self._load_new_nodes(nodes, f"从剪贴板导入 {len(nodes)} 个节点")
             self._show_import_errors(errors)
         else:
@@ -1257,6 +1290,7 @@ class MainWindow(QMainWindow):
             detail = "\n".join(errors[:3]) if errors else "请确认输入为节点链接、Base64 或 Clash 配置"
             QMessageBox.warning(self, "未识别到有效节点", detail)
             return
+        self._clear_subscription_source()
         self._load_new_nodes(nodes, f"成功导入 {len(nodes)} 个节点")
         self._show_import_errors(errors)
 
@@ -1281,6 +1315,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._notify("该文件中未发现有效代理节点", "error")
                 return
+            self._clear_subscription_source()
             self._load_new_nodes(nodes, f"已从 {os.path.basename(fpath)} 导入 {len(nodes)} 个节点")
             self._show_import_errors(errors)
         except Exception as exc:
@@ -1406,6 +1441,8 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans == QMessageBox.StandardButton.Yes:
+            self._cancel_probes()
+            self._clear_subscription_source()
             self.nodes = []
             clear_cached_nodes()
             self.table_model.set_nodes(self.nodes)
@@ -1419,6 +1456,8 @@ class MainWindow(QMainWindow):
         src_row = self.proxy_model.mapToSource(idx).row()
         if not (0 <= src_row < len(self.nodes)):
             return
+        if not self.table_view.selectionModel().isRowSelected(idx.row(), idx.parent()):
+            self.table_view.selectRow(idx.row())
         node = self.nodes[src_row]
 
         menu = QMenu(self)
@@ -1448,7 +1487,7 @@ class MainWindow(QMainWindow):
         node = self.nodes[src_row]
         val, ok = QInputDialog.getInt(
             self,
-            "修改本地 HTTP 端口",
+            "修改本地混合代理端口",
             f"节点：{node.name}\n设置独立监听端口 (1024 ~ 65535)：",
             node.local_port or self._get_start_port(),
             1024,
@@ -1466,23 +1505,22 @@ class MainWindow(QMainWindow):
     # Copy & Export Helpers
     # ------------------------------------------------------------------
     def _ensure_ready_for_export(self) -> bool:
-        if self._service_busy or self._has_unapplied_changes():
+        if self._closing or self._service_busy or self._has_unapplied_changes():
             self._notify("请等待服务操作完成并应用配置变更后，再复制或导出代理", "warning")
             return False
         return True
 
     def _copy_node_proxy(self, node: ProxyNode, fmt: str) -> None:
-        if self._ensure_ready_for_export() and node in self.nodes and node.enabled:
+        if self._ensure_ready_for_export() and node in self.nodes and node.enabled and node.local_port > 0:
             self._copy_text_toast(self._format_node_proxy_line(node, fmt), "已复制代理地址")
 
     def _format_node_proxy_line(self, node: ProxyNode, fmt: str = "url") -> str:
         raw_ip = str(self.combo_listen.currentData() or "127.0.0.1")
-        host_disp = "127.0.0.1" if raw_ip == "0.0.0.0" else raw_ip
+        host_disp = format_proxy_host(raw_ip)
         auth_prefix = ""
-        if self.settings.get("auth_enabled") and self.settings.get("auth_user") and self.settings.get("auth_pass"):
-            u = quote(str(self.settings["auth_user"]), safe="")
-            p = quote(str(self.settings["auth_pass"]), safe="")
-            auth_prefix = f"{u}:{p}@"
+        user, password = self._get_auth_pair()
+        if user and password:
+            auth_prefix = f"{quote(user, safe='')}:{quote(password, safe='')}@"
 
         if fmt == "hostport":
             return f"{auth_prefix}{host_disp}:{node.local_port}"
@@ -1529,6 +1567,9 @@ class MainWindow(QMainWindow):
         if not self._ensure_ready_for_export():
             return
         candidates = [n for n in self.nodes if n.enabled and n.local_port > 0]
+        if not candidates:
+            self._notify("当前没有已启用的节点可导出", "warning")
+            return
         try:
             lines = [self._format_node_proxy_line(n, "comment") for n in candidates]
             with open(fpath, "w", encoding="utf-8") as f:
@@ -1549,7 +1590,7 @@ class MainWindow(QMainWindow):
         return "", ""
 
     def _toggle_service(self) -> None:
-        if self._service_busy:
+        if self._closing or self._service_busy:
             return
         if self.xray_mgr.is_running():
             self._stop_service()
@@ -1557,7 +1598,7 @@ class MainWindow(QMainWindow):
             self._start_service()
 
     def _start_service(self) -> None:
-        if self._service_busy:
+        if self._closing or self._service_busy:
             return
         active = [n for n in self.nodes if n.enabled]
         if not active:
@@ -1566,6 +1607,9 @@ class MainWindow(QMainWindow):
 
         listen_ip = str(self.combo_listen.currentData() or "127.0.0.1")
         auth_u, auth_p = self._get_auth_pair()
+        if self.settings.get("auth_enabled") and not (auth_u and auth_p):
+            self._notify("请在鉴权设置中补齐用户名和密码", "warning")
+            return
 
         self._set_service_busy(True)
         self.btn_service.setText(" 正在启动...")
@@ -1579,12 +1623,12 @@ class MainWindow(QMainWindow):
                 ok, msg = self.xray_mgr.start(nodes_snapshot, listen_ip=listen_ip, auth_user=auth_u, auth_pass=auth_p)
             except Exception as exc:
                 ok, msg = False, str(exc)
-            self.bridge.serviceTransitioned.emit(ok, msg, "start")
+            self._emit_worker_signal(self.bridge.serviceTransitioned, ok, msg, "start")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _reload_service(self) -> None:
-        if self._service_busy:
+        if self._closing or self._service_busy:
             return
         active = [n for n in self.nodes if n.enabled]
         if not active:
@@ -1593,6 +1637,9 @@ class MainWindow(QMainWindow):
 
         listen_ip = str(self.combo_listen.currentData() or "127.0.0.1")
         auth_u, auth_p = self._get_auth_pair()
+        if self.settings.get("auth_enabled") and not (auth_u and auth_p):
+            self._notify("请在鉴权设置中补齐用户名和密码", "warning")
+            return
 
         self._set_service_busy(True)
         self.btn_reload_dirty.setText(" 正在重载...")
@@ -1604,30 +1651,40 @@ class MainWindow(QMainWindow):
                 ok, msg = self.xray_mgr.reload(nodes_snapshot, listen_ip=listen_ip, auth_user=auth_u, auth_pass=auth_p)
             except Exception as exc:
                 ok, msg = False, str(exc)
-            self.bridge.serviceTransitioned.emit(ok, msg, "reload")
+            self._emit_worker_signal(self.bridge.serviceTransitioned, ok, msg, "reload")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _stop_service(self) -> None:
-        if self._service_busy:
+        if self._closing or self._service_busy:
             return
         self._set_service_busy(True)
         self.btn_service.setText(" 正在停止...")
 
         def _worker() -> None:
             ok, msg = self.xray_mgr.stop()
-            self.bridge.serviceTransitioned.emit(ok, msg, "stop")
+            self._emit_worker_signal(self.bridge.serviceTransitioned, ok, msg, "stop")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _set_service_busy(self, busy: bool) -> None:
         self._service_busy = busy
+        if busy:
+            self._cancel_probes()
         self.btn_service.setEnabled(not busy)
         self.btn_reload_dirty.setEnabled(not busy)
         if self.tray:
             self.act_tray_toggle.setEnabled(not busy)
 
     def _on_service_transitioned(self, ok: bool, msg: str, action: str) -> None:
+        if action == "close":
+            self._shutdown_complete = True
+            if not ok:
+                QMessageBox.critical(self, "Xray 停止失败", msg)
+            self.close()
+            return
+        if self._closing:
+            return
         self._set_service_busy(False)
         self.btn_reload_dirty.setText(" 应用变更")
 
@@ -1689,10 +1746,11 @@ class MainWindow(QMainWindow):
         self.btn_service.style().polish(self.btn_service)
 
     def _check_xray_alive(self) -> None:
-        if self._service_busy:
+        if self._closing or self._service_busy:
             return
         if self._applied_signature is not None and not self.xray_mgr.is_running():
             self._applied_signature = None
+            self._cancel_probes()
             self._apply_running_ui_state(False)
             self._set_service_badge_style("error", "● 内核意外退出")
             self._sync_dirty_banner()
@@ -1702,8 +1760,13 @@ class MainWindow(QMainWindow):
     # Latency Speedtest & Exit IP Probing
     # ------------------------------------------------------------------
     def _ensure_ready_for_probe(self) -> bool:
+        if self._closing:
+            return False
         if self._service_busy:
             self._notify("请等待服务操作完成后再进行测试", "warning")
+            return False
+        if not any(n.enabled for n in self.nodes):
+            self._notify("请先启用要测试的节点", "warning")
             return False
         if not self.xray_mgr.is_running():
             self._notify("请先点击右上角【启动映射服务】后再进行测试", "warning", 2800)
@@ -1715,148 +1778,139 @@ class MainWindow(QMainWindow):
         return True
 
     def _test_single_row_async(self, src_row: int) -> None:
-        if not self._ensure_ready_for_probe():
-            return
-        node = self.nodes[src_row]
-        if not node.enabled or node.local_port <= 0:
-            self._notify("该节点未启用", "warning")
-            return
-        self._run_speed_probe([node], single=True)
+        self._start_probe(speed=True, src_row=src_row)
 
     def _test_all_speed_async(self) -> None:
-        if self._testing_speed or not self._ensure_ready_for_probe():
+        self._start_probe(speed=True)
+
+    def _probe_single_exit_ip_async(self, src_row: int) -> None:
+        self._start_probe(speed=False, src_row=src_row)
+
+    def _probe_all_exit_ips_async(self) -> None:
+        self._start_probe(speed=False)
+
+    def _start_probe(self, *, speed: bool, src_row: Optional[int] = None) -> None:
+        current_task = self._speed_task if speed else self._exit_ip_task
+        if current_task is not None or not self._ensure_ready_for_probe():
             return
-
-        active = [n for n in self.nodes if n.enabled and n.local_port > 0]
-        if not active:
+        if src_row is not None and not 0 <= src_row < len(self.nodes):
             return
-
-        self._testing_speed = True
-        self.btn_speed.setEnabled(False)
-        self.btn_speed.setText(f" 测速 0/{len(active)}")
-        self._run_speed_probe(active)
-
-    def _run_speed_probe(self, nodes: List[ProxyNode], single: bool = False) -> None:
-        test_url = str(self.settings.get("test_url") or "https://cp.cloudflare.com/generate_204")
-        signature = self._calc_config_signature()
-        generation = self.xray_mgr.generation
+        candidates = self.nodes if src_row is None else [self.nodes[src_row]]
+        nodes = tuple(node for node in candidates if node.enabled and node.local_port > 0)
+        if not nodes:
+            self._notify("没有已启用且已分配端口的节点可测试", "warning")
+            return
+        task = ProbeTask(self.xray_mgr.generation, self._calc_config_signature(), nodes, src_row is not None)
         snapshots = copy.deepcopy(nodes)
         originals = {id(snapshot): node for node, snapshot in zip(nodes, snapshots)}
 
+        options = {}
+        if speed:
+            self._speed_task = task
+            button, label = self.btn_speed, "测速"
+            operation = self.xray_mgr.test_all_proxies
+            progress, finished = self.bridge.speedProgress, self.bridge.speedFinished
+            options["test_url"] = str(self.settings.get("test_url") or "https://cp.cloudflare.com/generate_204")
+        else:
+            self._exit_ip_task = task
+            button, label = self.btn_probe_ip, "探测"
+            operation = self.xray_mgr.probe_all_exit_ips
+            progress, finished = self.bridge.exitIpProgress, self.bridge.exitIpFinished
+        button.setEnabled(False)
+        button.setText(f" {label} 0/{len(nodes)}")
+
         def _worker() -> None:
+            error = ""
             try:
-                self.xray_mgr.test_all_proxies(
-                    snapshots, test_url=test_url,
-                    progress_cb=lambda d, t, n: self.bridge.speedProgress.emit(
-                        d, t, (originals[id(n)], n, signature, generation)),
+                operation(
+                    list(snapshots), cancel_event=task.cancelled, **options,
+                    progress_cb=lambda done, total, snapshot: self._emit_worker_signal(
+                        progress, done, total, (task, originals[id(snapshot)], snapshot),
+                    ),
                 )
             except Exception as exc:
-                self.bridge.logReceived.emit(f"测速失败: {exc}")
-            finally:
-                if not single:
-                    self.bridge.speedFinished.emit()
+                error = f"{label}失败: {exc}"
+            self._emit_worker_signal(finished, task, error)
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _accept_probe_result(self, payload) -> Optional[Tuple[ProxyNode, ProxyNode]]:
-        node, snapshot, signature, generation = payload
-        if (self._service_busy or not self.xray_mgr.is_running()
-                or generation != self.xray_mgr.generation or node not in self.nodes
-                or signature != self._applied_signature or signature != self._calc_config_signature()):
-            return None
-        return node, snapshot
+    def _reset_probe(self, *, speed: bool) -> None:
+        task = self._speed_task if speed else self._exit_ip_task
+        if task is None:
+            return
+        task.cancelled.set()
+        if speed:
+            self._speed_task = None
+            self.btn_speed.setEnabled(True)
+            self.btn_speed.setText(" 并发测速")
+        else:
+            self._exit_ip_task = None
+            self.btn_probe_ip.setEnabled(True)
+            self.btn_probe_ip.setText(" 查出口 IP")
+
+    def _cancel_probes(self) -> None:
+        self._reset_probe(speed=True)
+        self._reset_probe(speed=False)
+
+    def _probe_is_current(self, task: ProbeTask, *, speed: bool) -> bool:
+        current = self._speed_task if speed else self._exit_ip_task
+        return (not self._closing and not self._service_busy and task is current
+                and self.xray_mgr.is_running() and task.generation == self.xray_mgr.generation
+                and task.signature == self._applied_signature and task.signature == self._calc_config_signature())
 
     def _on_speed_progress(self, done: int, total: int, payload) -> None:
-        if self._testing_speed:
+        task, node, snapshot = payload
+        if self._probe_is_current(task, speed=True) and node in self.nodes:
             self.btn_speed.setText(f" 测速 {done}/{total}")
-        accepted = self._accept_probe_result(payload)
-        if accepted is None:
+            node.latency_ms, node.last_error = snapshot.latency_ms, snapshot.last_error
+            self.table_model.refresh_row(self.nodes.index(node))
+
+    def _on_exit_ip_progress(self, done: int, total: int, payload) -> None:
+        task, node, snapshot = payload
+        if self._probe_is_current(task, speed=False) and node in self.nodes:
+            self.btn_probe_ip.setText(f" 探测 {done}/{total}")
+            node.exit_ip = snapshot.exit_ip
+            self.table_model.refresh_row(self.nodes.index(node))
+
+    def _finish_probe(self, task: ProbeTask, error: str, *, speed: bool) -> bool:
+        if task is not (self._speed_task if speed else self._exit_ip_task):
+            return False
+        current = self._probe_is_current(task, speed=speed)
+        self._reset_probe(speed=speed)
+        if not current:
+            return False
+        self._persist_nodes()
+        if error:
+            self._append_log(error)
+            self._notify(error, "error")
+            return False
+        return True
+
+    def _on_speed_finished(self, task: ProbeTask, error: str) -> None:
+        if not self._finish_probe(task, error, speed=True):
             return
-        node, snapshot = accepted
-        node.latency_ms, node.last_error = snapshot.latency_ms, snapshot.last_error
-        self.table_model.refresh_row(self.nodes.index(node))
-        if total == 1 and not self._testing_speed:
-            self._persist_nodes()
-            if node.latency_ms and node.latency_ms >= 0:
+        if task.single:
+            node = task.nodes[0]
+            if node.latency_ms is not None and node.latency_ms >= 0:
                 self._notify(f"端口 {node.local_port} 连通正常 ({node.latency_ms} ms)", "success")
             else:
                 self._notify(f"端口 {node.local_port} 测试失败: {node.last_error}", "error")
-
-    def _on_speed_finished(self) -> None:
-        self._testing_speed = False
-        self.btn_speed.setEnabled(True)
-        self.btn_speed.setText(" 并发测速")
-        self._persist_nodes()
-        passed = sum(1 for n in self.nodes if n.enabled and n.latency_ms is not None and n.latency_ms >= 0)
-        enabled = sum(1 for n in self.nodes if n.enabled)
-        self._notify(f"测速完成 · {passed}/{enabled} 个端口连通正常", "success" if passed > 0 else "warning")
-
-    def _probe_single_exit_ip_async(self, src_row: int) -> None:
-        if not self._ensure_ready_for_probe():
             return
-        node = self.nodes[src_row]
-        if not node.enabled or node.local_port <= 0:
-            self._notify("该节点未启用", "warning")
+        passed = sum(1 for node in task.nodes if node.latency_ms is not None and node.latency_ms >= 0)
+        self._notify(f"测速完成 · {passed}/{len(task.nodes)} 个端口连通正常", "success" if passed else "warning")
+
+    def _on_exit_ip_finished(self, task: ProbeTask, error: str) -> None:
+        if not self._finish_probe(task, error, speed=False):
             return
-
-        self._run_exit_ip_probe([node], single=True)
-
-    def _probe_all_exit_ips_async(self) -> None:
-        if self._probing_ip or not self._ensure_ready_for_probe():
-            return
-        active = [n for n in self.nodes if n.enabled and n.local_port > 0]
-        if not active:
-            return
-
-        self._probing_ip = True
-        self.btn_probe_ip.setEnabled(False)
-        self.btn_probe_ip.setText(f" 探测 0/{len(active)}")
-        self._run_exit_ip_probe(active)
-
-    def _run_exit_ip_probe(self, nodes: List[ProxyNode], single: bool = False) -> None:
-        signature = self._calc_config_signature()
-        generation = self.xray_mgr.generation
-        snapshots = copy.deepcopy(nodes)
-        originals = {id(snapshot): node for node, snapshot in zip(nodes, snapshots)}
-
-        def _worker() -> None:
-            try:
-                self.xray_mgr.probe_all_exit_ips(
-                    snapshots,
-                    progress_cb=lambda d, t, n: self.bridge.exitIpProgress.emit(
-                        d, t, (originals[id(n)], n, signature, generation)),
-                )
-            except Exception as exc:
-                self.bridge.logReceived.emit(f"出口探测失败: {exc}")
-            finally:
-                if not single:
-                    self.bridge.exitIpFinished.emit()
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_exit_ip_progress(self, done: int, total: int, payload) -> None:
-        if self._probing_ip:
-            self.btn_probe_ip.setText(f" 探测 {done}/{total}")
-        accepted = self._accept_probe_result(payload)
-        if accepted is None:
-            return
-        node, snapshot = accepted
-        node.exit_ip = snapshot.exit_ip
-        self.table_model.refresh_row(self.nodes.index(node))
-        if total == 1 and not self._probing_ip:
-            self._persist_nodes()
+        if task.single:
+            node = task.nodes[0]
             if node.exit_ip:
                 self._notify(f"端口 {node.local_port} 落地出口: {node.exit_ip}", "success")
             else:
                 self._notify(f"端口 {node.local_port} 未能获取出口 IP", "error")
-
-    def _on_exit_ip_finished(self) -> None:
-        self._probing_ip = False
-        self.btn_probe_ip.setEnabled(True)
-        self.btn_probe_ip.setText(" 查出口 IP")
-        self._persist_nodes()
-        ok_cnt = sum(1 for n in self.nodes if n.enabled and n.exit_ip)
-        self._notify(f"出口探测完成 · 已识别 {ok_cnt} 个端口的落地 IP", "success" if ok_cnt else "warning")
+            return
+        found = sum(1 for node in task.nodes if node.exit_ip)
+        self._notify(f"出口探测完成 · 已识别 {found} 个端口的落地 IP", "success" if found else "warning")
 
     # ------------------------------------------------------------------
     # Settings, Console & Window Close
@@ -1883,8 +1937,18 @@ class MainWindow(QMainWindow):
     def _toggle_console_drawer(self, checked: bool) -> None:
         self.console_card.setVisible(checked)
 
+    def _emit_worker_signal(self, signal, *args, during_close: bool = False) -> None:
+        if self._closing and not during_close:
+            return
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            # Qt may have destroyed the bridge while the worker was running.
+            pass
+
     def _append_log(self, msg: str) -> None:
-        self.txt_console.appendPlainText(msg)
+        if not self._closing:
+            self.txt_console.appendPlainText(msg)
 
     def _clear_console(self) -> None:
         self.txt_console.clear()
@@ -1894,16 +1958,16 @@ class MainWindow(QMainWindow):
         has_sel = self.txt_console.textCursor().hasSelection()
         has_text = bool(self.txt_console.toPlainText())
 
-        act_copy = menu.addAction("Copy")
+        act_copy = menu.addAction("复制")
         act_copy.setEnabled(has_sel)
         act_copy.triggered.connect(self.txt_console.copy)
 
-        act_sel_all = menu.addAction("Select All")
+        act_sel_all = menu.addAction("全选")
         act_sel_all.setEnabled(has_text)
         act_sel_all.triggered.connect(self.txt_console.selectAll)
 
         menu.addSeparator()
-        act_clear = menu.addAction("Clear")
+        act_clear = menu.addAction("清空")
         act_clear.setEnabled(has_text)
         act_clear.triggered.connect(self._clear_console)
 
@@ -1928,44 +1992,64 @@ class MainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._save_window_state()
-
-        if self._force_quit or not self.xray_mgr.is_running():
-            self.xray_mgr.stop()
-            if self.tray:
-                self.tray.hide()
-            event.accept()
+        if self._closing:
+            if self._shutdown_complete:
+                if self.tray:
+                    self.tray.hide()
+                event.accept()
+            else:
+                event.ignore()
             return
 
-        if self.tray and self.tray.isVisible():
+        if not self._force_quit and self.xray_mgr.is_running() and self.tray and self.tray.isVisible():
             box = QMessageBox(self)
             box.setWindowTitle("代理服务运行中")
             box.setText("Xray 多端口映射服务正在运行中，请选择关闭方式：")
             btn_tray = box.addButton("最小化到系统托盘 (继续运行)", QMessageBox.ButtonRole.AcceptRole)
             btn_exit = box.addButton("停止服务并退出", QMessageBox.ButtonRole.DestructiveRole)
-            btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(btn_tray)
             box.exec()
 
             clicked = box.clickedButton()
             if clicked == btn_tray:
+                self._save_window_state()
                 event.ignore()
                 self.hide()
                 self.tray.showMessage(
                     "XraySubMapper 仍在后台运行",
-                    "本地 HTTP 代理端口保持可用，双击托盘图标可恢复主窗口。",
+                    "本地混合代理端口仍可用，双击托盘图标可恢复主窗口。",
                     QSystemTrayIcon.MessageIcon.Information,
                     2000,
                 )
                 return
-            if clicked == btn_cancel:
+            if clicked != btn_exit:
                 event.ignore()
                 return
 
-        self.xray_mgr.stop()
-        if self.tray:
-            self.tray.hide()
-        event.accept()
+        self._closing = True
+        self._cancel_probes()
+        self._save_window_state()
+        if not self._service_busy and self.xray_mgr.process is None and not self.xray_mgr.is_running():
+            self._shutdown_complete = True
+            if self.tray:
+                self.tray.hide()
+            event.accept()
+            return
+
+        event.ignore()
+        self.setEnabled(False)
+        self._set_service_badge_style("starting", "● 正在停止内核...")
+        completed = self.bridge.serviceTransitioned
+
+        def _worker() -> None:
+            try:
+                ok, msg = self.xray_mgr.close()
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            self._emit_worker_signal(completed, ok, msg, "close", during_close=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 ModernApp = MainWindow
@@ -1976,7 +2060,10 @@ def _set_windows_app_user_model_id() -> None:
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XraySubMapper.Desktop.App.1")
+            set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+            set_app_id.argtypes = [ctypes.c_wchar_p]
+            set_app_id.restype = ctypes.c_long
+            set_app_id("XraySubMapper.Desktop.App.1")
         except Exception:
             pass
 
@@ -2000,10 +2087,19 @@ def run_gui() -> None:
     if sys.platform == "win32":
         try:
             import ctypes
+            from ctypes.wintypes import BOOL, HWND
+
+            user32 = ctypes.windll.user32
+            user32.IsWindowVisible.argtypes = [HWND]
+            user32.IsWindowVisible.restype = BOOL
+            user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+            user32.ShowWindow.restype = BOOL
+            user32.SetForegroundWindow.argtypes = [HWND]
+            user32.SetForegroundWindow.restype = BOOL
             hwnd = int(win.winId())
-            if not ctypes.windll.user32.IsWindowVisible(hwnd):
-                ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            if not user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            user32.SetForegroundWindow(hwnd)
         except Exception:
             pass
     sys.exit(app.exec())

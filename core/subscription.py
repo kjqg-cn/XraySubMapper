@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
@@ -9,18 +10,27 @@ from .parser import ProxyNode, parse_clash_proxy, parse_node_link, safe_b64decod
 
 DEFAULT_USER_AGENT = "ClashMetaForAndroid/2.10.1 v2rayN/6.45 Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 SUPPORTED_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "socks://", "socks5://")
+MAX_SUBSCRIPTION_BYTES = 16 * 1024 * 1024
+_SHARE_LINK = re.compile(r"^[ \t]*([a-zA-Z][a-zA-Z0-9+.-]*)://", re.MULTILINE)
+_CLASH_PROXIES = re.compile(r"""^[ \t]*(?:proxies|'proxies'|"proxies")[ \t]*:""", re.MULTILINE)
 
 
-def _decode_response_bytes(resp: requests.Response) -> str:
-    """Decode HTTP response bytes prioritizing UTF-8 (with BOM support) over chardet guesses."""
-    raw = resp.content
-    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+def _decode_response_bytes(raw: bytearray, encoding: str | None) -> str:
+    for enc in ("utf-8-sig", "gb18030"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    fallback = resp.apparent_encoding or "utf-8"
-    return raw.decode(fallback, errors="replace")
+    try:
+        return raw.decode(encoding or "utf-8", errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def discard_redirect_body(response: requests.Response, **kwargs: Any) -> None:
+    # Requests otherwise buffers each redirect body while resolving the next URL.
+    if response.is_redirect:
+        response.close()
 
 
 def parse_subscription_userinfo(header_val: str) -> Dict[str, Any]:
@@ -38,7 +48,7 @@ def parse_subscription_userinfo(header_val: str) -> Dict[str, Any]:
             v = v.strip()
             try:
                 info[k] = int(float(v))
-            except ValueError:
+            except (ValueError, OverflowError):
                 pass
     if not info:
         return {}
@@ -93,33 +103,32 @@ def fetch_subscription_with_meta(
         "Accept": "*/*",
     }
 
-    resp = None
-    last_err = None
     # Try system environment first, fallback to direct connection if local system proxy is broken
     for trust_env in (True, False):
         try:
             with requests.Session() as sess:
                 sess.trust_env = trust_env
-                resp = sess.get(clean_url, headers=headers, timeout=timeout, allow_redirects=True)
-                resp.raise_for_status()
-                break
-        except requests.exceptions.HTTPError:
+                with sess.get(
+                    clean_url, headers=headers, timeout=timeout, stream=True,
+                    hooks={"response": discard_redirect_body},
+                ) as resp:
+                    resp.raise_for_status()
+                    raw = bytearray()
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if len(raw) + len(chunk) > MAX_SUBSCRIPTION_BYTES:
+                            raise ValueError(f"订阅响应体超过大小上限 ({MAX_SUBSCRIPTION_BYTES} 字节)")
+                        raw.extend(chunk)
+                    meta = parse_subscription_userinfo(resp.headers.get("Subscription-Userinfo", ""))
+                    return _decode_response_bytes(raw, resp.encoding), meta
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            if (trust_env and response is not None and response.status_code == 407
+                    and requests.utils.select_proxy(response.url, requests.utils.get_environ_proxies(response.url))):
+                continue
             raise
-        except Exception as e:
-            last_err = e
-            resp = None
-
-    if resp is None:
-        raise last_err or RuntimeError("下载订阅失败")
-
-    userinfo_raw = ""
-    for hk, hv in resp.headers.items():
-        if hk.lower() == "subscription-userinfo":
-            userinfo_raw = hv
-            break
-
-    meta = parse_subscription_userinfo(userinfo_raw)
-    return _decode_response_bytes(resp), meta
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if not trust_env:
+                raise
 
 
 def fetch_subscription(url: str, timeout: int = 15, user_agent: str = DEFAULT_USER_AGENT) -> str:
@@ -141,42 +150,45 @@ def parse_subscription_content(content: str) -> Tuple[List[ProxyNode], List[str]
         return nodes, ["订阅内容为空"]
 
     # 1. Try Clash / Mihomo YAML format
-    if "proxies:" in content:
+    if _CLASH_PROXIES.search(content) or content.startswith("{"):
         try:
             data = yaml.safe_load(content)
-            if isinstance(data, dict) and isinstance(data.get("proxies"), list):
-                for p in data["proxies"]:
-                    if not isinstance(p, dict):
-                        continue
-                    try:
-                        node = parse_clash_proxy(p)
-                        nodes.append(node)
-                    except Exception as e:
-                        errors.append(f"解析 Clash 节点失败 [{p.get('name', 'unknown')}]: {e}")
-                if nodes:
-                    return nodes, errors
-        except Exception:
-            pass
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None)
+            location = f"（第 {mark.line + 1} 行，第 {mark.column + 1} 列）" if mark else ""
+            return nodes, [f"Clash YAML 语法错误{location}"]
+        if not isinstance(data, dict) or not isinstance(data.get("proxies"), list):
+            return nodes, ["Clash YAML 缺少有效的 proxies 列表"]
+        for index, proxy in enumerate(data["proxies"], 1):
+            if not isinstance(proxy, dict):
+                errors.append(f"第 {index} 个 Clash 节点格式无效")
+                continue
+            try:
+                nodes.append(parse_clash_proxy(proxy))
+            except Exception as exc:
+                errors.append(f"解析 Clash 节点失败 [{proxy.get('name', 'unknown')}]: {exc}")
+        return nodes, errors
 
-    # 2. Try Base64 decoding if not starting with plain protocol links
-    decoded_text = ""
-    first_lower = content[:16].lower()
-    is_plain_links = any(first_lower.startswith(p) for p in SUPPORTED_SCHEMES)
-    if not is_plain_links:
+    # 2. Decode Base64 subscriptions, including ones with only unsupported links.
+    if not _SHARE_LINK.search(content):
         try:
             decoded_text = safe_b64decode(content).lstrip("\ufeff").strip()
         except Exception:
             decoded_text = ""
-
-    if decoded_text and any(p in decoded_text.lower() for p in SUPPORTED_SCHEMES):
-        lines = [line.strip() for line in decoded_text.splitlines() if line.strip()]
-    else:
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if _SHARE_LINK.search(decoded_text):
+            content = decoded_text
 
     # 3. Parse each line
-    for idx, line in enumerate(lines, 1):
-        lower_line = line.lower()
-        if not any(lower_line.startswith(p) for p in SUPPORTED_SCHEMES):
+    for idx, line in enumerate(content.splitlines(), 1):
+        line = line.strip()
+        match = _SHARE_LINK.match(line)
+        if not match:
+            continue
+        scheme = match.group(1).lower()
+        if scheme in ("http", "https"):
+            continue
+        if f"{scheme}://" not in SUPPORTED_SCHEMES:
+            errors.append(f"第 {idx} 行不支持的节点协议: {scheme}")
             continue
         try:
             node = parse_node_link(line)

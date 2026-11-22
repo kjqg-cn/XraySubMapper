@@ -2,7 +2,7 @@ import base64
 import json
 import re
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlparse
 
 
 DUMMY_SERVERS = {"", "127.0.0.1", "0.0.0.0", "localhost", "1.1.1.1", "8.8.8.8", "::1"}
@@ -36,9 +36,9 @@ def _safe_bool(val: Any, default: bool = False) -> bool:
     if val is None:
         return default
     s = str(val).strip().lower()
-    if s in ("1", "true", "yes", "tls"):
+    if s in ("1", "true", "yes", "on", "tls"):
         return True
-    if s in ("0", "false", "no", "none", ""):
+    if s in ("0", "false", "no", "off", "none", ""):
         return False
     return default
 
@@ -71,13 +71,20 @@ def _split_host_port(host_port: str, default_port: int = 443) -> Tuple[str, int]
     return parsed.hostname, port
 
 
-def _validate_transport(network: str, allow_insecure: bool = False) -> None:
-    if allow_insecure:
-        raise ValueError("Xray 26.11.9+ 不支持 allowInsecure / skip-cert-verify；请使用有效证书的节点")
+def _validate_transport(network: str) -> None:
     if network in ("h2", "http", "quic"):
         raise ValueError(f"Xray 已移除 {network} 传输，请向服务端获取 XHTTP 节点配置")
     if network not in ("tcp", "raw", "ws", "websocket", "grpc", "xhttp", "splithttp", "httpupgrade"):
         raise ValueError(f"不支持的传输方式: {network}")
+
+
+def _validate_stream_security(security: str, allow_insecure: bool, public_key: str = "") -> None:
+    if security not in ("none", "tls", "reality"):
+        raise ValueError(f"不支持的传输安全配置: {security}")
+    if security == "reality" and not public_key.strip():
+        raise ValueError("REALITY 缺少公钥 (pbk / public-key)")
+    if security != "none" and allow_insecure:
+        raise ValueError("Xray 26.11.9+ 不支持 allowInsecure / skip-cert-verify；请使用有效证书的节点")
 
 
 def _apply_transport_settings(
@@ -138,7 +145,6 @@ def _build_tls_settings(
     server_name: str,
     fp: str = "",
     alpn: str = "",
-    allow_insecure: bool = False,
 ) -> Dict[str, Any]:
     tls_settings: Dict[str, Any] = {}
     if server_name:
@@ -149,7 +155,6 @@ def _build_tls_settings(
         alpn_list = [x.strip() for x in alpn.split(",") if x.strip()]
         if alpn_list:
             tls_settings["alpn"] = alpn_list
-    _validate_transport("tcp", allow_insecure)
     return tls_settings
 
 
@@ -229,7 +234,8 @@ class VMessNode(ProxyNode):
         self.fp = fp or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
-        _validate_transport(self.network, self.allow_insecure)
+        _validate_transport(self.network)
+        _validate_stream_security(self.tls or "none", self.allow_insecure)
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -260,7 +266,6 @@ class VMessNode(ProxyNode):
                 server_name=self.sni or self.host,
                 fp=self.fp,
                 alpn=self.alpn,
-                allow_insecure=self.allow_insecure,
             )
         else:
             stream["security"] = "none"
@@ -337,7 +342,8 @@ class VLESSNode(ProxyNode):
         self.spx = spx or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
-        _validate_transport(self.network, self.allow_insecure)
+        _validate_transport(self.network)
+        _validate_stream_security(self.security, self.allow_insecure, self.pbk)
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -388,7 +394,6 @@ class VLESSNode(ProxyNode):
                 server_name=server_name,
                 fp=self.fp,
                 alpn=self.alpn,
-                allow_insecure=self.allow_insecure,
             )
 
         _apply_transport_settings(
@@ -453,7 +458,8 @@ class TrojanNode(ProxyNode):
         self.spx = spx or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
-        _validate_transport(self.network, self.allow_insecure)
+        _validate_transport(self.network)
+        _validate_stream_security(self.security, self.allow_insecure, self.pbk)
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -495,7 +501,6 @@ class TrojanNode(ProxyNode):
                 server_name=server_name,
                 fp=self.fp,
                 alpn=self.alpn,
-                allow_insecure=self.allow_insecure,
             )
 
         _apply_transport_settings(
@@ -684,7 +689,7 @@ def node_from_dict(d: Dict[str, Any]) -> Optional[ProxyNode]:
 
 
 def parse_vmess(link: str) -> VMessNode:
-    b64 = link[8:].strip()
+    b64, _, fragment = link[8:].partition("#")
     decoded = safe_b64decode(b64)
     data = json.loads(decoded)
     if not isinstance(data, dict):
@@ -697,7 +702,7 @@ def parse_vmess(link: str) -> VMessNode:
         mode = "multi"
 
     return VMessNode(
-        name=str(data.get("ps") or "").strip(),
+        name=str(data.get("ps") or unquote(fragment)).strip(),
         server=str(data.get("add") or "").strip(),
         port=_safe_int(data.get("port"), 443),
         uuid=str(data.get("id") or "").strip(),
@@ -711,22 +716,35 @@ def parse_vmess(link: str) -> VMessNode:
         sni=str(data.get("sni") or "").strip(),
         alpn=str(data.get("alpn") or "").strip(),
         fp=str(data.get("fp") or "").strip(),
-        allow_insecure=_safe_bool(data.get("allowInsecure") or data.get("insecure")),
+        allow_insecure=any(_safe_bool(value) for key, value in data.items()
+                           if key.lower() in ("allowinsecure", "insecure")),
         mode=mode,
         raw_link=link,
     )
+
+
+def _parse_share_query(query: str) -> Dict[str, list[str]]:
+    # Share links use percent encoding. A literal plus is part of the value.
+    params: Dict[str, list[str]] = {}
+    for key, value in parse_qsl(query.replace("+", "%2B")):
+        params.setdefault(key.lower(), []).append(value)
+    return params
+
+
+def _query_allows_insecure(params: Dict[str, list[str]]) -> bool:
+    return any(_safe_bool(value) for key in ("allowinsecure", "insecure") for value in params.get(key, ()))
 
 
 def parse_vless(link: str) -> VLESSNode:
     u = urlparse(link)
     uuid = unquote(u.username or "")
     server = u.hostname or ""
-    port = u.port or 443
+    port = 443 if u.port is None else u.port
     name = unquote(u.fragment) if u.fragment else f"vless-{server}:{port}"
-    params = parse_qs(u.query)
+    params = _parse_share_query(u.query)
 
     def get_p(key: str, default: str = "") -> str:
-        return params.get(key, [default])[0]
+        return params.get(key.lower(), [default])[0]
 
     net = get_p("type", "tcp").lower()
     raw_path = get_p("serviceName") if net == "grpc" and get_p("serviceName") else get_p("path")
@@ -749,7 +767,7 @@ def parse_vless(link: str) -> VLESSNode:
         pbk=get_p("pbk"),
         sid=get_p("sid"),
         spx=get_p("spx"),
-        allow_insecure=_safe_bool(get_p("allowInsecure") or get_p("insecure")),
+        allow_insecure=_query_allows_insecure(params),
         mode=get_p("mode"),
         raw_link=link,
     )
@@ -757,14 +775,15 @@ def parse_vless(link: str) -> VLESSNode:
 
 def parse_trojan(link: str) -> TrojanNode:
     u = urlparse(link)
-    password = unquote(u.username or "")
+    userinfo, separator, _ = u.netloc.rpartition("@")
+    password = unquote(userinfo) if separator else ""
     server = u.hostname or ""
-    port = u.port or 443
+    port = 443 if u.port is None else u.port
     name = unquote(u.fragment) if u.fragment else f"trojan-{server}:{port}"
-    params = parse_qs(u.query)
+    params = _parse_share_query(u.query)
 
     def get_p(key: str, default: str = "") -> str:
-        return params.get(key, [default])[0]
+        return params.get(key.lower(), [default])[0]
 
     net = get_p("type", "tcp").lower()
     raw_path = get_p("serviceName") if net == "grpc" and get_p("serviceName") else get_p("path")
@@ -785,7 +804,7 @@ def parse_trojan(link: str) -> TrojanNode:
         pbk=get_p("pbk"),
         sid=get_p("sid"),
         spx=get_p("spx"),
-        allow_insecure=_safe_bool(get_p("allowInsecure") or get_p("insecure")),
+        allow_insecure=_query_allows_insecure(params),
         mode=get_p("mode"),
         raw_link=link,
     )
@@ -915,15 +934,20 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
     header_type = "none"
     mode = ""
 
-    ws_opts = p.get("ws-opts") or p.get("ws-path")
-    if isinstance(ws_opts, dict):
-        path = str(ws_opts.get("path") or "")
-        headers = ws_opts.get("headers")
+    if network in ("ws", "websocket", "httpupgrade"):
+        ws_opts = p.get("ws-opts")
+        ws_opts = ws_opts if isinstance(ws_opts, dict) else {}
+        path = str(ws_opts.get("path") or p.get("ws-path") or "")
+        headers = ws_opts.get("headers") or p.get("ws-headers")
         if isinstance(headers, dict):
             host = str(headers.get("Host") or headers.get("host") or "")
+        if _safe_bool(ws_opts.get("v2ray-http-upgrade")):
+            network = "httpupgrade"
+        if network == "httpupgrade" and _safe_bool(ws_opts.get("v2ray-http-upgrade-fast-open")):
+            raise ValueError("不支持 Mihomo HTTPUpgrade Fast Open")
 
     grpc_opts = p.get("grpc-opts")
-    if isinstance(grpc_opts, dict):
+    if network == "grpc" and isinstance(grpc_opts, dict):
         path = str(grpc_opts.get("grpc-service-name") or path)
 
     xhttp_opts = p.get("xhttp-opts")
@@ -957,7 +981,9 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
                 host = str(h_list[0])
 
     sni = str(p.get("servername") or p.get("sni") or "").strip()
-    fp = str(p.get("client-fingerprint") or p.get("fingerprint") or "").strip()
+    if p.get("fingerprint"):
+        raise ValueError("暂不支持 Clash TLS 证书指纹锁定 (fingerprint)")
+    fp = str(p.get("client-fingerprint") or "").strip()
     raw_alpn = p.get("alpn")
     if isinstance(raw_alpn, list):
         alpn = ",".join(str(x) for x in raw_alpn if x)
@@ -967,6 +993,8 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
     allow_insecure = _safe_bool(p.get("skip-cert-verify", False))
 
     reality_opts = p.get("reality-opts")
+    if reality_opts is not None and not isinstance(reality_opts, dict):
+        raise ValueError("Clash reality-opts 必须为映射")
     pbk = ""
     sid = ""
     if isinstance(reality_opts, dict):
@@ -983,10 +1011,21 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
         "fp": fp,
         "alpn": alpn,
         "allow_insecure": allow_insecure,
-        "has_reality": isinstance(reality_opts, dict) and bool(pbk),
+        "has_reality": isinstance(reality_opts, dict) and bool(reality_opts),
         "pbk": pbk,
         "sid": sid,
     }
+
+
+def _clash_tls_enabled(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "tls"):
+        return True
+    if text in ("0", "false", "no", "off", "none", ""):
+        return False
+    raise ValueError("Clash tls 配置无效，请使用布尔值")
 
 
 def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
@@ -994,9 +1033,12 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
     name = str(p.get("name", "")).strip()
     server = str(p.get("server", "")).strip()
     port = _safe_int(p.get("port"), 443)
-    tr = _extract_clash_transport(p)
+    if ptype in ("vmess", "vless", "trojan"):
+        tr = _extract_clash_transport(p)
 
     if ptype == "vmess":
+        if tr["has_reality"]:
+            raise ValueError("不支持 Clash VMess 的 REALITY 配置")
         return VMessNode(
             name=name,
             server=server,
@@ -1008,7 +1050,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             header_type=tr["header_type"],
             host=tr["host"],
             path=tr["path"],
-            tls="tls" if p.get("tls") else "",
+            tls="tls" if _clash_tls_enabled(p.get("tls")) else "",
             sni=tr["sni"],
             alpn=tr["alpn"],
             fp=tr["fp"],
@@ -1016,7 +1058,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             mode=tr["mode"],
         )
     if ptype == "vless":
-        security = "reality" if tr["has_reality"] else ("tls" if p.get("tls") else "none")
+        security = "reality" if tr["has_reality"] else ("tls" if _clash_tls_enabled(p.get("tls")) else "none")
         return VLESSNode(
             name=name,
             server=server,
@@ -1037,7 +1079,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             mode=tr["mode"],
         )
     if ptype == "trojan":
-        security = "reality" if tr["has_reality"] else ("tls" if p.get("tls", True) else "none")
+        security = "reality" if tr["has_reality"] else ("tls" if _clash_tls_enabled(p.get("tls", True)) else "none")
         return TrojanNode(
             name=name,
             server=server,
@@ -1067,6 +1109,8 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             password=str(p.get("password", "")),
         )
     if ptype in ("socks", "socks5"):
+        if _clash_tls_enabled(p.get("tls")) or p.get("fingerprint"):
+            raise ValueError("暂不支持带 TLS 或证书指纹锁定的 Clash SOCKS5 节点")
         return SocksNode(
             name=name,
             server=server,

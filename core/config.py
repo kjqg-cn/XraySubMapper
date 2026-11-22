@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import sys
+import tempfile
 import threading
 import warnings
 from typing import Any, Dict, List, Set
@@ -49,7 +50,7 @@ def _crypt_data(data: bytes, protect: bool) -> bytes:
         kernel32.LocalFree(target.data)
 
 
-def _read_json(file_path: str) -> Any:
+def _read_json(file_path: str, expected_type: type) -> Any:
     key = os.path.normcase(os.path.abspath(file_path))
     try:
         with open(file_path, "r", encoding="utf-8-sig") as f:
@@ -58,6 +59,8 @@ def _read_json(file_path: str) -> Any:
         if protected:
             encrypted = base64.b64decode(payload["data"], validate=True)
             payload = json.loads(_crypt_data(encrypted, protect=False).decode("utf-8"))
+        if not isinstance(payload, expected_type):
+            raise ValueError("缓存格式无效")
         with _WRITE_LOCK:
             _UNREADABLE_FILES.discard(key)
         if not protected:
@@ -94,10 +97,20 @@ def _atomic_write_json(file_path: str, payload: Any) -> None:
         encrypted = _crypt_data(raw, protect=True)
         envelope = {"format": "dpapi-v1", "data": base64.b64encode(encrypted).decode("ascii")}
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        tmp_path = f"{file_path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(envelope, f, indent=2)
-        os.replace(tmp_path, file_path)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=os.path.dirname(file_path),
+                prefix=f"{os.path.basename(file_path)}.", suffix=".tmp", delete=False,
+            ) as f:
+                tmp_path = f.name
+                json.dump(envelope, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
 
 def load_settings() -> Dict[str, Any]:
@@ -106,9 +119,7 @@ def load_settings() -> Dict[str, Any]:
     res["sub_userinfo"] = {}
     if os.path.isfile(CONFIG_FILE):
         try:
-            data = _read_json(CONFIG_FILE)
-            if isinstance(data, dict):
-                res.update(data)
+            res.update(_read_json(CONFIG_FILE, dict))
         except Exception as exc:
             warnings.warn(f"无法读取或保护设置缓存: {exc}", RuntimeWarning)
     return res
@@ -137,18 +148,21 @@ def load_cached_nodes() -> List[Any]:
     if not os.path.isfile(NODES_CACHE_FILE):
         return []
     try:
-        raw_list = _read_json(NODES_CACHE_FILE)
-        if isinstance(raw_list, list):
-            nodes = []
-            for item in raw_list:
-                try:
-                    node = node_from_dict(item)
-                except (ValueError, TypeError) as exc:
-                    warnings.warn(f"跳过不支持的缓存节点: {exc}", RuntimeWarning)
-                    continue
-                if node:
-                    nodes.append(node)
-            return nodes
+        raw_list = _read_json(NODES_CACHE_FILE, list)
+        nodes = []
+        for item in raw_list:
+            try:
+                node = node_from_dict(item)
+            except (ValueError, TypeError, AttributeError):
+                node = None
+            if node is not None:
+                nodes.append(node)
+        skipped = len(raw_list) - len(nodes)
+        if skipped:
+            with _WRITE_LOCK:
+                _UNREADABLE_FILES.add(os.path.normcase(os.path.abspath(NODES_CACHE_FILE)))
+            warnings.warn(f"跳过 {skipped} 个不兼容的缓存节点，已阻止自动覆盖原缓存", RuntimeWarning)
+        return nodes
     except Exception as exc:
         warnings.warn(f"无法读取或保护节点缓存: {exc}", RuntimeWarning)
     return []

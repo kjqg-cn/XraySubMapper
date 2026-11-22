@@ -36,7 +36,7 @@
 ### 兼容范围与导入提示
 
 - 内核要求为官方 **Xray 26.11.9 或更高版本**，启动时自动检查版本。已验证的传输为 TCP/RAW、WebSocket、gRPC、XHTTP 和 HTTPUpgrade。
-- `allowInsecure` / `skip-cert-verify: true`、旧 H2/HTTP/QUIC transport、未实现的传输及 Shadowsocks 插件节点会报告导入错误，不会静默改成其他协议或降低证书校验。请向节点提供方获取受支持的配置。
+- 加密节点的 `allowInsecure` / `skip-cert-verify: true`、Clash TLS 证书指纹锁定、Clash SOCKS5 TLS、旧 H2/HTTP/QUIC 传输及 Shadowsocks 插件节点会报告导入错误。请向节点提供方获取受支持的配置。
 - Clash XHTTP 支持 `xhttp-opts.path`、`host`、`mode`；其他 XHTTP 选项会明确报告尚不支持。
 - 更新同一订阅时按连接配置匹配节点，保留端口锁定和启停选择；手动替换导入会重新编排端口。
 - 服务运行时，节点、端口、监听地址或鉴权有待应用变更，会拦截代理复制和导出，避免导出与实际出口不符的地址。服务停止时可导出计划映射。
@@ -67,6 +67,8 @@
      ```
 
 ### 方式三：命令行自动化模式（CLI）
+CLI 通过源码入口 `python main.py` 运行。单文件便携版 EXE 提供桌面 GUI。
+
 ```bash
 # 从订阅链接下载并从 10800 端口开始映射
 python main.py --sub "https://example.com/your-sub" --start-port 10800
@@ -74,8 +76,8 @@ python main.py --sub "https://example.com/your-sub" --start-port 10800
 # 启动后自动并发测速，并将测速可用的代理导出到 proxies.txt
 python main.py --sub "https://example.com/your-sub" --start-port 10800 --test --export proxies.txt
 
-# 从本地 Clash YAML 或节点文本文件读取并限制映射前 10 个节点
-python main.py --file config.yaml --max-nodes 10 --listen 0.0.0.0
+# 从本地文件映射前 10 个节点，并为局域网访问启用鉴权
+python main.py --file config.yaml --max-nodes 10 --listen 0.0.0.0 --auth-user proxyuser --auth-pass YOUR_PASSWORD
 ```
 
 ---
@@ -105,7 +107,7 @@ curl -x socks5h://127.0.0.1:10800 https://api.ipify.org
 
 ## 自行打包单文件便携版
 
-确保项目根目录下已放置官方 `xray.exe`，执行：
+确保项目根目录下已放置官方 Xray 26.11.9 或更高版本的 `xray.exe`。构建前会校验内核版本。
 ```bash
 pip install pyinstaller
 python build_portable.py

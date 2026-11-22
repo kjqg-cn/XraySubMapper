@@ -100,3 +100,35 @@ def test_malformed_cache_cannot_be_overwritten_by_defaults(cache_paths):
     with pytest.warns(RuntimeWarning, match="阻止覆盖"):
         config.save_settings(restored)
     assert path.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+def test_partially_unreadable_cache_preserves_incompatible_records(cache_paths, make_node):
+    path = cache_paths[1]
+    config._atomic_write_json(str(path), [make_node().to_dict(), {"protocol": "future"}])
+    original = path.read_bytes()
+    with pytest.warns(RuntimeWarning, match="不兼容的缓存节点"):
+        assert len(config.load_cached_nodes()) == 1
+    with pytest.warns(RuntimeWarning, match="阻止覆盖"):
+        config.save_cached_nodes([make_node("new")])
+    assert path.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+def test_interrupted_replace_leaves_previous_cache(cache_paths, make_node, monkeypatch):
+    path = cache_paths[1]
+    config.save_cached_nodes([make_node("old")])
+    original = path.read_bytes()
+    attempted = []
+
+    def fail_replace(source, dest):
+        attempted.append(source)
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(config.os, "replace", fail_replace)
+    for _ in range(2):
+        with pytest.warns(RuntimeWarning, match="保存失败"):
+            config.save_cached_nodes([make_node("new")])
+    assert len(set(attempted)) == 2
+    assert not list(path.parent.glob("*.tmp"))
+    assert path.read_bytes() == original

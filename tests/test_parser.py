@@ -1,4 +1,5 @@
 import base64
+import json
 
 import pytest
 
@@ -31,6 +32,21 @@ def test_query_values_are_decoded_once(protocol, auth):
         assert node.password == "p@ss:word"
 
 
+@pytest.mark.parametrize("protocol,auth", [("vless", UUID), ("trojan", "my:pass:word")])
+def test_literal_plus_and_case_insensitive_query(protocol, auth):
+    node = parse_node_link(f"{protocol}://{auth}@example.com?Type=grpc&servicename=svc+a%2Bb")
+    assert node.port == 443
+    assert node.to_outbound("test")["streamSettings"]["grpcSettings"]["serviceName"] == "svc+a+b"
+    if protocol == "trojan":
+        assert node.password == "my:pass:word"
+
+
+@pytest.mark.parametrize("prefix", [f"vless://{UUID}", "trojan://password"])
+def test_explicit_zero_port_keeps_placeholder_disabled(prefix):
+    node = parse_node_link(f"{prefix}@example.com:0")
+    assert node.port == 0 and not node.enabled
+
+
 @pytest.mark.parametrize("network", ["kcp", "quic", "h2", "http", "unknown"])
 def test_unsupported_transports_report_node_error(network):
     valid = "trojan://password@example.com:443#valid"
@@ -42,6 +58,8 @@ def test_unsupported_transports_report_node_error(network):
 
 @pytest.mark.parametrize("text", [
     f"vless://{UUID}@example.com:443?security=tls&allowInsecure=1",
+    f"vless://{UUID}@example.com:443?security=tls&allowInsecure=0&allowinsecure=1",
+    "trojan://password@example.com?SECURITY=TLS&insecure=false&AllowInsecure=YES",
     "proxies:\n  - {name: insecure, type: trojan, server: example.com, port: 443, password: test, skip-cert-verify: true}",
 ])
 def test_removed_tls_option_is_rejected_at_import(text):
@@ -74,6 +92,42 @@ def test_clash_xhttp_fields_survive_cache_roundtrip():
 def test_unknown_xhttp_options_raise_instead_of_being_dropped():
     with pytest.raises(ValueError, match="XHTTP"):
         parse_clash_proxy({"type": "vless", "network": "xhttp", "xhttp-opts": {"extra": {"test": True}}})
+
+
+def test_clash_legacy_websocket_and_mihomo_httpupgrade():
+    proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "network": "ws",
+             "ws-path": "/legacy", "ws-headers": {"Host": "cdn.example.com"}}
+    stream = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]
+    assert stream["wsSettings"] == {"path": "/legacy", "host": "cdn.example.com"}
+    proxy["ws-opts"] = {"v2ray-http-upgrade": True, "path": "/upgrade"}
+    stream = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]
+    assert stream["network"] == "httpupgrade"
+    assert stream["httpupgradeSettings"] == {"path": "/upgrade", "host": "cdn.example.com"}
+
+
+def test_clash_rejects_certificate_pin_and_encrypted_socks():
+    tls_proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "tls": True,
+                 "client-fingerprint": "chrome", "fingerprint": "ab" * 32}
+    with pytest.raises(ValueError, match="证书指纹锁定"):
+        parse_clash_proxy(tls_proxy)
+    with pytest.raises(ValueError, match="TLS"):
+        parse_clash_proxy({"type": "socks5", "server": "example.com", "tls": True, "skip-cert-verify": True})
+    with pytest.raises(ValueError, match="tls 配置无效"):
+        parse_clash_proxy({"type": "socks5", "server": "example.com", "tls": "unexpected"})
+
+
+def test_plain_node_accepts_irrelevant_certificate_option_and_invalid_security_is_reported():
+    proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "tls": False, "skip-cert-verify": True}
+    assert parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]["security"] == "none"
+    with pytest.raises(ValueError, match="缺少公钥"):
+        parse_clash_proxy(dict(proxy, **{"reality-opts": {"short-id": "ab"}}))
+    with pytest.raises(ValueError, match="安全配置"):
+        parse_node_link("trojan://password@example.com?security=xtls")
+
+
+def test_vmess_unpadded_payload_with_fragment():
+    encoded = base64.urlsafe_b64encode(json.dumps({"add": "example.com", "id": UUID}).encode()).decode().rstrip("=")
+    assert parse_node_link(f"vmess://{encoded}#My%20Node").name == "My Node"
 
 
 @pytest.mark.parametrize("encoded", [False, True])

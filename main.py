@@ -14,7 +14,12 @@ def _show_startup_error(title: str, message: str) -> None:
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+            from ctypes.wintypes import HWND, UINT
+
+            show_message = ctypes.windll.user32.MessageBoxW
+            show_message.argtypes = [HWND, ctypes.c_wchar_p, ctypes.c_wchar_p, UINT]
+            show_message.restype = ctypes.c_int
+            show_message(None, message, title, 0x10)
             return
         except Exception:
             pass
@@ -23,26 +28,29 @@ def _show_startup_error(title: str, message: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Xray 多节点多端口 HTTP 代理映射工具 (XraySubMapper)",
+        description="Xray 多节点多端口混合代理工具 (HTTP + SOCKS5)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例用法:
   直接双击或执行 python main.py 启动桌面图形界面 (GUI)
   命令行启动 (CLI):
     python main.py --sub "https://example.com/sub" --start-port 10800
     python main.py --file nodes.txt --start-port 10800 --test
-    python main.py --sub "https://example.com/sub" --listen 0.0.0.0 --max-nodes 10
+    python main.py --file nodes.txt --listen 0.0.0.0 --auth-user proxyuser --auth-pass YOUR_PASSWORD
 """,
     )
     parser.add_argument("--sub", type=str, help="订阅链接 URL")
     parser.add_argument("--file", type=str, help="包含节点链接或订阅内容的本地文件路径")
-    parser.add_argument("--start-port", type=int, default=10800, help="本地 HTTP 代理起始端口 (默认: 10800)")
+    parser.add_argument("--start-port", type=int, default=10800, help="本地混合代理起始端口 (默认: 10800)")
     parser.add_argument("--listen", type=str, default="127.0.0.1", help="本地监听 IP (默认: 127.0.0.1，局域网共享可用 0.0.0.0)")
     parser.add_argument("--max-nodes", type=int, default=0, help="最大映射节点数量 (0 表示不限制)")
+    parser.add_argument("--auth-user", help="本地代理鉴权用户名，与 --auth-pass 一起使用")
+    parser.add_argument("--auth-pass", help="本地代理鉴权密码，与 --auth-user 一起使用")
     parser.add_argument("--test", action="store_true", help="启动后自动进行连通性与延时测速")
     parser.add_argument("--export", type=str, help="将生成的代理列表导出为文本文件")
     parser.add_argument("--gui", action="store_true", help="强制启动图形界面")
 
-    if len(sys.argv) == 1 or "--gui" in sys.argv:
+    args = parser.parse_args()
+    if len(sys.argv) == 1 or args.gui:
         try:
             from gui.app import run_gui
         except ImportError as exc:
@@ -55,7 +63,6 @@ def main() -> None:
             sys.exit(1)
         run_gui()
     else:
-        args = parser.parse_args()
         from cli import run_cli
         run_cli(args)
 

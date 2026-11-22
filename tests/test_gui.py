@@ -12,7 +12,8 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
 from core.config import DEFAULT_SETTINGS
-from gui.app import MainWindow
+from gui.app import MainWindow, ProbeTask
+from gui.widgets import ProxySettingsDialog, extract_region_and_clean_name
 
 
 @pytest.fixture(scope="module")
@@ -35,7 +36,7 @@ def window(application, monkeypatch):
     window.xray_mgr.set_log_callback(lambda message: None)
     window._force_quit = True
     window.close()
-    application.processEvents()
+    spin(application, lambda: window._shutdown_complete)
 
 
 def spin(application, predicate):
@@ -123,6 +124,144 @@ def test_subscription_refresh_keeps_pins_and_enabled_state(window, make_node):
     assert not fresh_disabled.enabled
 
 
+def test_equivalent_subscription_refresh_does_not_require_reload(window, make_node, monkeypatch):
+    node = make_node("before", 10800)
+    window._load_new_nodes([node])
+    window._applied_signature = window._calc_config_signature()
+    monkeypatch.setattr(window.xray_mgr, "is_running", lambda: True)
+    window._load_new_nodes([make_node("after")], preserve_state=True)
+    window.settings.update(auth_user="unused", auth_pass="unused")
+    assert not window._has_unapplied_changes()
+
+
+def test_overflow_does_not_reuse_the_last_pinned_port(window, make_node, monkeypatch):
+    locked = make_node("locked", 65535)
+    locked.port_pinned = True
+    window.nodes = [locked, make_node("auto"), make_node("overflow")]
+    window.table_model.set_nodes(window.nodes)
+    monkeypatch.setattr(window, "_get_start_port", lambda: 65534)
+    window._assign_ports()
+    assert [n.local_port for n in window.nodes] == [65535, 65534, 0]
+    assert "1 个节点未分配端口" in window.lbl_stats.text()
+
+
+def test_repeated_enter_and_late_fetch_after_manual_import(window, application, make_node, monkeypatch):
+    url = "https://example.com/sub"
+    entered, release = threading.Event(), threading.Event()
+    requests, completed = [], []
+
+    def fetch(request_url):
+        requests.append(request_url)
+        entered.set()
+        assert release.wait(5)
+        return make_node("remote").raw_link, {"summary": "old"}
+
+    monkeypatch.setattr("gui.app.fetch_subscription_with_meta", fetch)
+    window.bridge.fetchFinished.connect(lambda *args: completed.append(args))
+    window.settings.update(subscription_url=url, sub_userinfo={"summary": "old"}, recent_urls=[url])
+    window.inp_url.setText(url)
+    window.inp_url.returnPressed.emit()
+    try:
+        assert entered.wait(5)
+        window.inp_url.returnPressed.emit()
+        window._parse_and_load_raw_text(make_node("manual").raw_link)
+        release.set()
+        spin(application, lambda: bool(completed))
+        assert requests == [url]
+        assert [node.name for node in window.nodes] == ["manual"]
+        assert not window.settings["subscription_url"] and not window.settings["sub_userinfo"]
+        assert window.settings["recent_urls"] == [url]
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("kind", ["speed", "exit"])
+def test_single_and_batch_probes_share_a_task(window, application, make_node, monkeypatch, kind):
+    window._load_new_nodes([make_node("first"), make_node("second")])
+    window._applied_signature = window._calc_config_signature()
+    monkeypatch.setattr(window.xray_mgr, "is_running", lambda: True)
+    entered, release = threading.Event(), threading.Event()
+    batches = []
+
+    def operation(nodes, *, progress_cb, **kwargs):
+        batches.append(len(nodes))
+        entered.set()
+        assert release.wait(5)
+        for index, node in enumerate(nodes, 1):
+            node.latency_ms, node.exit_ip = 0, "192.0.2.1"
+            progress_cb(index, len(nodes), node)
+
+    speed = kind == "speed"
+    monkeypatch.setattr(window.xray_mgr, "test_all_proxies" if speed else "probe_all_exit_ips", operation)
+    batch = window._test_all_speed_async if speed else window._probe_all_exit_ips_async
+    single = window._test_single_row_async if speed else window._probe_single_exit_ip_async
+    button = window.btn_speed if speed else window.btn_probe_ip
+    batch()
+    try:
+        assert entered.wait(5)
+        single(0)
+        assert "0/2" in button.text()
+        release.set()
+        spin(application, button.isEnabled)
+        assert batches == [2]
+        if speed:
+            assert window.nodes[0].latency_ms == 0
+        else:
+            assert window.nodes[0].exit_ip == "192.0.2.1"
+    finally:
+        release.set()
+
+
+def test_no_enabled_nodes_does_not_stop_service_for_probe(window, make_node, monkeypatch):
+    node = make_node()
+    node.enabled = False
+    window.nodes = [node]
+    monkeypatch.setattr(window.xray_mgr, "is_running", lambda: True)
+    reload_service = Mock()
+    monkeypatch.setattr(window, "_reload_service", reload_service)
+    window._test_all_speed_async()
+    reload_service.assert_not_called()
+
+
+def test_closing_with_service_transition_waits_off_gui_thread(window, application, monkeypatch):
+    window._set_service_busy(True)
+    entered, release = threading.Event(), threading.Event()
+    caller = threading.get_ident()
+
+    def close():
+        assert threading.get_ident() != caller
+        entered.set()
+        assert release.wait(5)
+        return True, "OK"
+
+    monkeypatch.setattr(window.xray_mgr, "close", close)
+    try:
+        assert not window.close()
+        assert entered.wait(5) and not window._shutdown_complete
+        release.set()
+        spin(application, lambda: window._shutdown_complete)
+    finally:
+        release.set()
+
+
+def test_incomplete_auth_cannot_be_saved(window, monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr("gui.widgets.QMessageBox.warning", warning)
+    dialog = ProxySettingsDialog(True, "user", "", "", parent=window)
+    dialog.accept()
+    warning.assert_called_once()
+    assert not dialog.result()
+    dialog.inp_pass.setText("password")
+    dialog.accept()
+    assert dialog.get_values()[:3] == (True, "user", "password")
+    assert dialog.result() == dialog.DialogCode.Accepted
+
+
+@pytest.mark.parametrize("name", ["My-Network-Node", "Ukraine-01", "Fukuoka-01", "Jerusalem-01"])
+def test_unrelated_english_names_do_not_match_region_abbreviations(name):
+    assert extract_region_and_clean_name(name) == ("", name)
+
+
 @pytest.mark.parametrize("kind", ["speed", "exit"])
 @pytest.mark.parametrize("change", ["port", "generation", "replace"])
 def test_queued_probe_result_cannot_update_new_configuration(window, make_node, monkeypatch, kind, change):
@@ -134,17 +273,26 @@ def test_queued_probe_result_cannot_update_new_configuration(window, make_node, 
     window._applied_signature = signature
     tested = copy.deepcopy(node)
     tested.latency_ms, tested.exit_ip = 42, "192.0.2.1"
-    payload = (node, tested, signature, window.xray_mgr.generation)
+    task = ProbeTask(window.xray_mgr.generation, signature, (node,), False)
+    setattr(window, "_speed_task" if kind == "speed" else "_exit_ip_task", task)
+    payload = (task, node, tested)
     if change == "port":
         node.local_port = 19881
     elif change == "generation":
         window.xray_mgr.generation += 1
     else:
-        window.nodes = [make_node(port=19880)]
-        window.table_model.set_nodes(window.nodes)
+        window._load_new_nodes([make_node(port=19880)])
+    notify = window._notify
+    notify.reset_mock()
+    persist = Mock()
+    monkeypatch.setattr(window, "_persist_nodes", persist)
     handler = window._on_speed_progress if kind == "speed" else window._on_exit_ip_progress
     handler(1, 1, payload)
+    finish = window._on_speed_finished if kind == "speed" else window._on_exit_ip_finished
+    finish(task, "")
     assert node.latency_ms is None and node.exit_ip == ""
+    notify.assert_not_called()
+    persist.assert_not_called()
 
 
 def test_busy_service_blocks_window_and_tray_reentry(window, monkeypatch):
@@ -173,11 +321,15 @@ def test_valid_probe_result_is_applied_on_gui_thread(window, make_node, monkeypa
     signature = window._calc_config_signature()
     window._applied_signature = signature
     tested = copy.deepcopy(node)
-    tested.latency_ms, tested.exit_ip = 42, "192.0.2.1"
-    payload = (node, tested, signature, window.xray_mgr.generation)
+    tested.latency_ms, tested.exit_ip = 0, "192.0.2.1"
+    task = ProbeTask(window.xray_mgr.generation, signature, (node,), True)
+    window._speed_task = window._exit_ip_task = task
+    payload = (task, node, tested)
     window._on_speed_progress(1, 1, payload)
     window._on_exit_ip_progress(1, 1, payload)
-    assert node.latency_ms == 42 and node.exit_ip == "192.0.2.1"
+    window._on_speed_finished(task, "")
+    assert node.latency_ms == 0 and node.exit_ip == "192.0.2.1"
+    assert window._notify.call_args.args[1] == "success"
 
 
 def test_cache_read_failure_is_visible_in_gui(window, application, monkeypatch):

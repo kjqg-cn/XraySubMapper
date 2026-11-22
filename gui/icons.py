@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Dict, Tuple
 
 from PySide6.QtCore import QByteArray, QRectF, Qt
@@ -83,7 +84,11 @@ def svg_pixmap(name: str, color: str = "#334155", size: int = 16) -> QPixmap:
     app = QGuiApplication.instance()
     dpr = float(app.primaryScreen().devicePixelRatio()) if (app and app.primaryScreen()) else 1.0
     dpr = max(1.0, dpr)
+    return QPixmap(_render_svg_pixmap(name, color, size, dpr))
 
+
+@lru_cache(maxsize=128)
+def _render_svg_pixmap(name: str, color: str, size: int, dpr: float) -> QPixmap:
     body = SVG_PATHS.get(name, SVG_PATHS["route"]).format(color=color)
     svg_xml = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '

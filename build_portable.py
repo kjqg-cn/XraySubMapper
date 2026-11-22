@@ -1,20 +1,21 @@
 import os
-import shutil
 import struct
 import subprocess
 import sys
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QGuiApplication
-
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)
 
-from gui.icons import _render_logo_pixmap  # noqa: E402
+from core.xray_manager import XrayManager  # noqa: E402
 
 
 def generate_multi_size_ico(ico_path: str) -> None:
     """Generate a native multi-resolution Windows .ico file directly from vector SVG logo."""
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+    from PySide6.QtGui import QGuiApplication
+
+    from gui.icons import _render_logo_pixmap
+
     app = QGuiApplication.instance() or QGuiApplication([])
     sizes = [16, 24, 32, 48, 64, 128, 256]
     png_blobs = []
@@ -57,7 +58,11 @@ def build() -> None:
 
     if not os.path.isfile(xray_bin):
         raise FileNotFoundError(f"Missing xray.exe at {xray_bin}")
+    ok, version = XrayManager(xray_bin).check_version()
+    if not ok:
+        raise SystemExit(f"无法打包 {xray_bin}\n{version}")
 
+    print(f"Bundling Xray {version}")
     print("[1/3] Generating multi-resolution Windows icon (16..256px)...")
     generate_multi_size_ico(ico_path)
 

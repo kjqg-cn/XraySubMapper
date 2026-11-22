@@ -1,13 +1,22 @@
 import argparse
+import ipaddress
 import signal
 import sys
+import threading
 import time
+from urllib.parse import quote
 
 from core.subscription import fetch_subscription_with_meta, parse_subscription_content
-from core.xray_manager import XrayManager
+from core.xray_manager import XrayManager, format_proxy_host
 
 
 def run_cli(args: argparse.Namespace) -> None:
+    auth_user = getattr(args, "auth_user", None)
+    auth_pass = getattr(args, "auth_pass", None)
+    if (auth_user is not None or auth_pass is not None) and not (auth_user and auth_pass):
+        print("[-] 请同时提供非空的 --auth-user 和 --auth-pass")
+        sys.exit(1)
+
     content = ""
     if args.sub:
         print(f"[*] 正在下载订阅链接: {args.sub}")
@@ -53,7 +62,13 @@ def run_cli(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     listen_ip = args.listen
-    export_host = "127.0.0.1" if listen_ip == "0.0.0.0" else listen_ip
+    export_host = format_proxy_host(listen_ip)
+    try:
+        loopback = ipaddress.ip_address(listen_ip).is_loopback
+    except ValueError:
+        loopback = listen_ip.lower() == "localhost"
+    if not loopback and not auth_user:
+        print("[!] 当前监听地址可供其他设备访问，建议启用代理鉴权。")
 
     print("\n" + "=" * 72)
     print(f"{'序号':<4} {'协议':<10} {'本地混合代理 (HTTP / SOCKS5)':<28} {'节点名称'}")
@@ -65,58 +80,67 @@ def run_cli(args: argparse.Namespace) -> None:
     print("=" * 72 + "\n")
 
     mgr = XrayManager()
-    ok, msg = mgr.start(active_nodes, listen_ip)
-    if not ok:
-        print(f"[-] 启动 Xray 失败: {msg}")
-        sys.exit(1)
-
-    print(f"[+] Xray 多端口混合代理 (HTTP + SOCKS5) 已成功启动！(监听 IP: {listen_ip})")
-    print(f"[*] 端口范围: {start_p} ~ {start_p + len(active_nodes) - 1} (每个端口均同时支持 http:// 与 socks5://)")
-
-    export_candidates = active_nodes
-    if args.test:
-        print("\n[*] 正在并发测试各节点 HTTPS 连通性与延时...")
-        results = mgr.test_all_proxies(active_nodes)
-        print("-" * 60)
-        passed = []
-        for node in active_nodes:
-            t_ok, lat, err = results.get(node.local_port, (False, None, "未知"))
-            status_str = f"{lat} ms" if t_ok else f"失败 ({err})"
-            print(f"端口 {node.local_port} ({node.name}): {status_str}")
-            if t_ok:
-                passed.append(node)
-        print("-" * 60)
-        print(f"[*] 测速完成: {len(passed)}/{len(active_nodes)} 个节点可用。\n")
-        export_candidates = passed
-
-    if args.export:
-        try:
-            with open(args.export, "w", encoding="utf-8") as f:
-                for node in export_candidates:
-                    lat_suffix = f" [{node.latency_ms}ms]" if node.latency_ms and node.latency_ms > 0 else ""
-                    f.write(f"http://{export_host}:{node.local_port} # {node.name}{lat_suffix}\n")
-            print(f"[+] 代理映射列表 ({len(export_candidates)} 条) 已保存至: {args.export}")
-        except Exception as e:
-            print(f"[-] 导出文件失败: {e}")
-
-    stopping = [False]
+    stopping = threading.Event()
+    interrupted = False
 
     def _sig_handler(sig, frame):
-        stopping[0] = True
-        print("\n[*] 正在停止 Xray 代理服务...")
-        mgr.stop()
-        print("[+] 服务已停止，程序退出。")
-        sys.exit(0)
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            stopping.set()
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
-    print("[*] 服务运行中... 按 Ctrl+C 停止退出。\n")
+    handlers = {}
     try:
-        while mgr.is_running():
-            time.sleep(1)
-        if not stopping[0]:
+        ok, msg = mgr.start(active_nodes, listen_ip, auth_user=auth_user or "", auth_pass=auth_pass or "")
+        if not ok:
+            print(f"[-] 启动 Xray 失败: {msg}")
+            sys.exit(1)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            handlers[sig] = signal.signal(sig, _sig_handler)
+        print(f"[+] Xray 混合代理已启动 (监听 {listen_ip}，端口 {start_p} ~ {start_p + len(active_nodes) - 1})")
+
+        export_candidates = active_nodes
+        if args.test:
+            print("\n[*] 正在并发测试各节点 HTTPS 连通性与延时...")
+            results = mgr.test_all_proxies(active_nodes, cancel_event=stopping)
+            if stopping.is_set():
+                return
+            export_candidates = []
+            for node in active_nodes:
+                t_ok, lat, err = results.get(node.local_port, (False, None, "未知"))
+                status_str = f"{lat} ms" if t_ok else f"失败 ({err})"
+                print(f"端口 {node.local_port} ({node.name}): {status_str}")
+                if t_ok:
+                    export_candidates.append(node)
+            print(f"[*] 测速完成: {len(export_candidates)}/{len(active_nodes)} 个节点可用。\n")
+
+        if args.export and not stopping.is_set():
+            auth_prefix = f"{quote(auth_user, safe='')}:{quote(auth_pass, safe='')}@" if auth_user else ""
+            try:
+                with open(args.export, "w", encoding="utf-8") as f:
+                    for node in export_candidates:
+                        latency = node.latency_ms
+                        suffix = f" [{latency}ms]" if latency is not None and latency >= 0 else ""
+                        f.write(f"http://{auth_prefix}{export_host}:{node.local_port} # {node.name}{suffix}\n")
+                print(f"[+] 代理映射列表 ({len(export_candidates)} 条) 已保存至: {args.export}")
+            except OSError as exc:
+                print(f"[-] 导出文件失败: {exc}")
+
+        print("[*] 服务运行中... 按 Ctrl+C 停止退出。")
+        while not stopping.is_set() and mgr.is_running():
+            time.sleep(0.2)
+        if not stopping.is_set():
             print("[-] 检测到 Xray 进程意外退出！")
             sys.exit(1)
     except KeyboardInterrupt:
-        _sig_handler(None, None)
+        stopping.set()
+    finally:
+        try:
+            ok, msg = mgr.stop()
+            if stopping.is_set():
+                print(f"\n{'[+]' if ok else '[-]'} {msg}")
+        finally:
+            for sig, handler in handlers.items():
+                if handler is not None:
+                    signal.signal(sig, handler)

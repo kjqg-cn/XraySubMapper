@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -89,6 +90,13 @@ REGION_KEYWORDS: List[Tuple[Tuple[str, ...], str]] = [
 
 _REGIONAL_RE = re.compile(r"([\U0001F1E6-\U0001F1FF]{2})")
 _MISC_SYMBOL_RE = re.compile(r"[\U0001F300-\U0001FAFF\u23F0-\u23FF\u2600-\u27BF]+")
+_REGION_PATTERNS = [
+    (re.compile("|".join(
+        rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])" if key.isascii() else re.escape(key)
+        for key in keys
+    )), iso)
+    for keys, iso in REGION_KEYWORDS
+]
 
 
 def extract_region_and_clean_name(raw_name: str) -> Tuple[str, str]:
@@ -112,8 +120,8 @@ def extract_region_and_clean_name(raw_name: str) -> Tuple[str, str]:
 
     if not region:
         lower = text.lower()
-        for keys, iso in REGION_KEYWORDS:
-            if any(k in lower for k in keys):
+        for pattern, iso in _REGION_PATTERNS:
+            if pattern.search(lower):
                 region = iso
                 break
 
@@ -133,7 +141,6 @@ def format_proto_badge_text(node: ProxyNode) -> str:
 
 class NodeTableModel(QAbstractTableModel):
     portEdited = Signal(int, int)  # (row_index, new_port)
-    nodeToggled = Signal(int)      # (row_index)
 
     HEADERS = ["启用", "#", "节点名称", "协议 / 传输", "远程入口 / 落地出口", "本地端口 (HTTP/SOCKS5)", "延迟 / 状态"]
 
@@ -947,7 +954,7 @@ class ProxySettingsDialog(QDialog):
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(14)
 
-        self.chk_auth = QCheckBox("启用本地 HTTP 代理账号密码鉴权 (开启 0.0.0.0 局域网共享时强烈建议)")
+        self.chk_auth = QCheckBox("启用本地混合代理账号密码鉴权")
         self.chk_auth.setChecked(auth_enabled)
         layout.addWidget(self.chk_auth)
 
@@ -988,6 +995,14 @@ class ProxySettingsDialog(QDialog):
     def get_values(self) -> Tuple[bool, str, str, str]:
         u = self.inp_user.text().strip()
         p = self.inp_pass.text().strip()
-        enabled = self.chk_auth.isChecked() and bool(u and p)
+        enabled = self.chk_auth.isChecked()
         t_url = self.inp_test_url.text().strip() or "https://cp.cloudflare.com/generate_204"
         return enabled, u, p, t_url
+
+    def accept(self) -> None:
+        enabled, user, password, _ = self.get_values()
+        if enabled and (not user or not password):
+            QMessageBox.warning(self, "鉴权配置不完整", "启用鉴权时，请同时填写用户名和密码。")
+            (self.inp_user if not user else self.inp_pass).setFocus()
+            return
+        super().accept()

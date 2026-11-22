@@ -1,14 +1,16 @@
-import atexit
 import copy
 import ctypes
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+import weakref
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -17,12 +19,27 @@ import requests
 
 from .config import get_app_dir
 from .parser import ProxyNode
+from .subscription import discard_redirect_body
+
+
+MIN_XRAY_VERSION = (26, 11, 9)
+_MIN_VERSION_TEXT = ".".join(map(str, MIN_XRAY_VERSION))
+_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+_POLL_INTERVAL = 0.025
+
+
+def _close_job(job: int) -> None:
+    close_handle = ctypes.windll.kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    close_handle(job)
 
 
 def _create_kill_on_close_job() -> Optional[int]:
     """Create a Windows Job Object configured with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE."""
     if sys.platform != "win32":
         return None
+    job = None
     try:
         kernel32 = ctypes.windll.kernel32
 
@@ -82,9 +99,12 @@ def _create_kill_on_close_job() -> Optional[int]:
             ctypes.sizeof(info),
         )
         if not ok:
+            _close_job(job)
             return None
         return int(job)
     except Exception:
+        if job:
+            _close_job(job)
         return None
 
 
@@ -101,23 +121,60 @@ def _assign_process_to_job(job_handle: Optional[int], proc: subprocess.Popen) ->
         pass
 
 
+def _terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1.0)
+
+
+def _connect_host(listen_ip: str) -> str:
+    return {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(listen_ip, listen_ip)
+
+
+def format_proxy_host(listen_ip: str) -> str:
+    host = _connect_host(listen_ip)
+    return f"[{host}]" if ":" in host else host
+
+
+def _can_connect(host: str, port: int, timeout: float) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _local_proxy_error(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "connection refused" in message or "10061" in message:
+        return "本地端口未监听"
+    if "407 proxy" in message:
+        return "代理鉴权失败 (407)"
+    return ""
+
+
 class XrayManager:
     def __init__(self, xray_path: Optional[str] = None):
         self.xray_path = xray_path or self._find_xray_executable()
         self.process: Optional[subprocess.Popen] = None
         self.log_callback: Optional[Callable[[str], None]] = None
-        self._log_thread: Optional[threading.Thread] = None
-        self._running = False
         self._job_handle: Optional[int] = _create_kill_on_close_job()
+        self._job_cleanup = weakref.finalize(self, _close_job, self._job_handle) if self._job_handle else None
+        self._process_cleanup: Optional[weakref.finalize] = None
         self.active_mappings: List[Dict[str, Any]] = []
         self.listen_ip: str = "127.0.0.1"
         self.auth_credentials: Optional[Tuple[str, str]] = None
         self._lifecycle_lock = threading.RLock()
+        self._stop_lock = threading.Lock()
         self._stop_requested = threading.Event()
+        self._closed = False
+        self._version_cache = None
         self._active_nodes: List[ProxyNode] = []
         self._active_config: Optional[Dict[str, Any]] = None
         self.generation = 0
-        atexit.register(self.stop)
 
     def _find_xray_executable(self) -> str:
         app_dir = get_app_dir()
@@ -154,30 +211,30 @@ class XrayManager:
 
     @staticmethod
     def check_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
-        """Return True if port is already bound by another process."""
-        probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+        """Check the TCP and UDP sockets required by a mixed inbound."""
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
         # 1. Active TCP connect probe catches non-exclusive binds on Windows
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.15)
-            if sock.connect_ex((probe_host, port)) == 0:
+        try:
+            if _can_connect(_connect_host(host), port, 0.15):
                 return True
+        except OSError:
+            return True
 
         # 2. Exclusive bind test on target listen address
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-                except OSError:
-                    pass
+        for sock_type in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             try:
-                sock.bind((host, port))
-                return False
+                with socket.socket(family, sock_type) as sock:
+                    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    sock.bind((host, port))
             except OSError:
                 return True
+        return False
 
     @staticmethod
     def validate_node_ports(
         nodes: List[ProxyNode], listen_ip: str = "127.0.0.1", owned_ports: Optional[set] = None,
+        stop_requested: Optional[threading.Event] = None,
     ) -> Tuple[bool, str]:
         """Validate port range, internal duplicates, and external port conflicts."""
         active_nodes = [n for n in nodes if n.enabled]
@@ -186,6 +243,8 @@ class XrayManager:
 
         seen_ports: Dict[int, str] = {}
         for n in active_nodes:
+            if stop_requested is not None and stop_requested.is_set():
+                return False, "端口校验已取消"
             if not (1 <= n.local_port <= 65535):
                 return False, f"节点 [{n.name}] 的本地端口 ({n.local_port}) 无效，须在 1~65535 之间。"
             if n.local_port in seen_ports:
@@ -198,6 +257,8 @@ class XrayManager:
 
         conflict_ports = []
         for n in active_nodes:
+            if stop_requested is not None and stop_requested.is_set():
+                return False, "端口校验已取消"
             if owned_ports and n.local_port in owned_ports:
                 continue
             if XrayManager.check_port_in_use(n.local_port, listen_ip):
@@ -222,6 +283,8 @@ class XrayManager:
         outbounds = []
         routing_rules = []
 
+        if bool(auth_user) != bool(auth_pass):
+            raise ValueError("启用代理鉴权时必须同时提供用户名和密码")
         use_auth = bool(auth_user and auth_pass)
 
         for idx, node in enumerate(nodes):
@@ -275,40 +338,84 @@ class XrayManager:
             },
         }
 
-    def validate_config(self, config: Dict[str, Any]) -> Tuple[bool, str]:
-        """Validate config in-memory via `xray run -test -c stdin:` without writing plaintext credentials to disk."""
-        if not os.path.isfile(self.xray_path) and os.path.sep in self.xray_path:
-            return False, f"未找到 Xray 内核可执行文件: {self.xray_path}"
+    def _resolved_xray_path(self) -> str:
+        path = shutil.which(self.xray_path)
+        if not path:
+            raise FileNotFoundError(f"未找到 Xray 内核可执行文件: {self.xray_path}")
+        return os.path.realpath(path)
 
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        payload = json.dumps(config, ensure_ascii=False)
+    def _run_preflight(self, command: List[str], payload: Optional[str] = None) -> Tuple[int, str]:
+        if self._stop_requested.is_set():
+            raise InterruptedError("Xray 校验已取消")
+        proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", creationflags=_CREATE_NO_WINDOW,
+        )
+        _assign_process_to_job(self._job_handle, proc)
+        done = threading.Event()
+        result = []
+        errors = []
 
+        def communicate() -> None:
+            try:
+                with proc:
+                    output, _ = proc.communicate(payload)
+                result.append((proc.returncode, output))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        # Windows pipe writes may block before communicate() reaches its timeout.
         try:
-            version = subprocess.run(
-                [self.xray_path, "version"], capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=10, creationflags=creationflags,
-            )
-            match = re.search(r"Xray (\d+)\.(\d+)\.(\d+)", version.stdout)
-            if version.returncode != 0 or not match:
-                return False, "无法识别 Xray 版本，请使用官方 Xray 26.11.9 或更高版本"
-            if tuple(int(v) for v in match.groups()) < (26, 11, 9):
-                return False, "需要 Xray 26.11.9 或更高版本，请升级内核"
-            proc = subprocess.run(
-                [self.xray_path, "run", "-test", "-c", "stdin:"],
-                input=payload,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                timeout=10,
-                creationflags=creationflags,
-            )
-            if proc.returncode == 0:
-                return True, "Configuration OK"
-            err_msg = proc.stderr.strip() or proc.stdout.strip()
-            return False, err_msg
-        except Exception as e:
-            return False, str(e)
+            threading.Thread(target=communicate, daemon=True).start()
+            deadline = time.monotonic() + 10
+            while not done.wait(_POLL_INTERVAL):
+                if self._stop_requested.is_set():
+                    raise InterruptedError("Xray 校验已取消")
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, 10)
+        finally:
+            if not done.is_set():
+                _terminate_process(proc)
+        if errors:
+            raise errors[0]
+        return result[0]
+
+    def check_version(self) -> Tuple[bool, str]:
+        """Apply the same Xray version requirement to runtime and portable builds."""
+        try:
+            path = self._resolved_xray_path()
+            stat = os.stat(path)
+            key = (path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            if self._version_cache and self._version_cache[0] == key:
+                version = self._version_cache[1]
+            else:
+                code, output = self._run_preflight([path, "version"])
+                match = re.search(r"^Xray (\d+)\.(\d+)\.(\d+)\b", output, re.MULTILINE)
+                if code != 0 or not match:
+                    return False, f"无法识别 Xray 版本，请使用官方 Xray {_MIN_VERSION_TEXT} 或更高版本"
+                version = tuple(int(component) for component in match.groups())
+                self._version_cache = (key, version)
+            detected = ".".join(map(str, version))
+            if version < MIN_XRAY_VERSION:
+                return False, f"需要 Xray {_MIN_VERSION_TEXT} 或更高版本，当前为 {detected}，请升级内核"
+            return True, detected
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+
+    def validate_config(self, config: Dict[str, Any]) -> Tuple[bool, str]:
+        """Validate through Xray's stdin without writing credentials to disk."""
+        ok, msg = self.check_version()
+        if not ok:
+            return False, msg
+        try:
+            command = [self._resolved_xray_path(), "run", "-test", "-c", "stdin:"]
+            code, output = self._run_preflight(command, json.dumps(config, ensure_ascii=False))
+            return (True, "Configuration OK") if code == 0 else (False, output.strip() or f"Xray 退出码 {code}")
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
+            return False, str(exc)
 
     def start(
         self,
@@ -317,11 +424,14 @@ class XrayManager:
         auth_user: str = "",
         auth_pass: str = "",
     ) -> Tuple[bool, str]:
-        """Start Xray process mapping enabled nodes to local HTTP ports."""
+        """Start Xray and wait until the mapped ports accept connections."""
         with self._lifecycle_lock:
+            if self._stop_requested.is_set():
+                return False, "启动已取消"
             if self.is_running():
                 return False, "代理服务已在运行中。"
-            self._stop_requested.clear()
+            if self.process is not None:
+                self._stop_process()
             active_nodes = copy.deepcopy([n for n in nodes if n.enabled])
             ok, msg, config = self._prepare_config(active_nodes, listen_ip, auth_user, auth_pass)
             if not ok:
@@ -332,7 +442,7 @@ class XrayManager:
         self, nodes: List[ProxyNode], listen_ip: str, auth_user: str, auth_pass: str,
         owned_ports: Optional[set] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports)
+        ok, err = self.validate_node_ports(nodes, listen_ip, owned_ports, self._stop_requested)
         if not ok:
             return False, err, {}
         try:
@@ -350,71 +460,111 @@ class XrayManager:
     ) -> Tuple[bool, str]:
         if self._stop_requested.is_set():
             return False, "启动已取消"
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         payload = json.dumps(config, ensure_ascii=False)
         proc = None
+        reader = None
+        recent_logs = deque(maxlen=8)
+        log_method = weakref.WeakMethod(self._log)
+        written = threading.Event()
+        write_errors = []
+
+        def log_output(message: str) -> None:
+            log = log_method()
+            if log is not None:
+                log(message)
+
+        def read_output(stream) -> None:
+            try:
+                with stream:
+                    for line in stream:
+                        message = line.rstrip()
+                        recent_logs.append(message[-512:])
+                        log_output(message)
+            except (OSError, ValueError):
+                pass
+            log_output("Xray 进程已退出。")
+
+        def write_config(stream) -> None:
+            try:
+                with stream:
+                    stream.write(payload)
+            except OSError as exc:
+                write_errors.append(exc)
+            finally:
+                written.set()
+
         try:
             proc = subprocess.Popen(
-                [self.xray_path, "run", "-c", "stdin:"],
+                [self._resolved_xray_path(), "run", "-c", "stdin:"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
-                errors="ignore",
+                errors="replace",
                 bufsize=1,
-                creationflags=creationflags,
+                creationflags=_CREATE_NO_WINDOW,
             )
             _assign_process_to_job(self._job_handle, proc)
-            self.process = proc
-            self._running = True
+            reader = threading.Thread(target=read_output, args=(proc.stdout,), daemon=True)
+            reader.start()
+            threading.Thread(target=write_config, args=(proc.stdin,), daemon=True).start()
 
-            def _reader(target_proc: subprocess.Popen) -> None:
-                stream = target_proc.stdout
-                if stream is not None:
-                    try:
-                        for line in stream:
-                            if line:
-                                self._log(line.rstrip())
-                    except (OSError, ValueError):
-                        pass
-                    finally:
-                        stream.close()
-                self._log("Xray 进程已退出。")
+            host = _connect_host(listen_ip)
+            pending = {node.local_port for node in active_nodes}
+            deadline = time.monotonic() + 5
+            while pending:
+                if self._stop_requested.is_set():
+                    raise InterruptedError("启动已取消")
+                if write_errors:
+                    raise write_errors[0]
+                if proc.poll() is not None:
+                    raise RuntimeError(f"Xray 启动后退出 (code={proc.returncode})")
+                if time.monotonic() >= deadline:
+                    ports = ", ".join(str(port) for port in sorted(pending)[:6])
+                    raise TimeoutError(f"等待 Xray 监听超时，仍有 {len(pending)} 个端口未就绪（{ports}）")
+                if written.is_set():
+                    for port in tuple(pending):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or self._stop_requested.is_set():
+                            break
+                        if _can_connect(host, port, min(remaining, _POLL_INTERVAL)):
+                            pending.remove(port)
+                if pending:
+                    self._stop_requested.wait(_POLL_INTERVAL)
 
-            self._log_thread = threading.Thread(target=_reader, args=(proc,), daemon=True)
-            self._log_thread.start()
-
-            if proc.stdin:
-                proc.stdin.write(payload)
-                proc.stdin.close()
-
-            time.sleep(0.25)
             if proc.poll() is not None:
-                self._stop_process()
-                return False, f"Xray 启动后立即异常退出 (code={proc.returncode})"
+                raise RuntimeError(f"Xray 启动后退出 (code={proc.returncode})")
             if self._stop_requested.is_set():
-                self._stop_process()
-                return False, "启动已取消"
+                raise InterruptedError("启动已取消")
 
-            self.listen_ip = listen_ip
-            self.auth_credentials = (auth_user, auth_pass) if (auth_user and auth_pass) else None
-            self._active_nodes = copy.deepcopy(active_nodes)
-            self._active_config = copy.deepcopy(config)
-            self.active_mappings = [
+            mappings = [
                 {"name": n.name, "protocol": n.protocol, "server": n.server,
                  "target_port": n.port, "local_port": n.local_port,
                  "in_tag": f"mixed-in-{i}", "out_tag": f"node-out-{i}"}
                 for i, n in enumerate(active_nodes)
             ]
+            self.listen_ip = listen_ip
+            self.auth_credentials = (auth_user, auth_pass) if (auth_user and auth_pass) else None
+            self._active_nodes = active_nodes
+            self._active_config = config
+            self.active_mappings = mappings
+            self._process_cleanup = weakref.finalize(self, _terminate_process, proc)
             self.generation += 1
+            self.process = proc
 
             self._log(f"Xray 已启动 · 监听 {listen_ip} · 映射 {len(active_nodes)} 个混合端口 (HTTP + SOCKS5)")
             return True, f"已启动并映射 {len(active_nodes)} 个本地端口 (同端口支持 HTTP 与 SOCKS5)"
-        except Exception as e:
+        except (Exception, KeyboardInterrupt) as exc:
             if proc is not None:
-                self._stop_process()
-            return False, f"启动 Xray 进程异常: {e}"
+                _terminate_process(proc)
+            if reader is not None and reader.ident is not None:
+                reader.join(timeout=0.1)
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            output = "\n".join(recent_logs.copy())
+            detail = f"\n{output}" if output else ""
+            return False, f"启动 Xray 进程异常: {exc}{detail}"
 
     def reload(
         self,
@@ -425,11 +575,17 @@ class XrayManager:
     ) -> Tuple[bool, str]:
         """Validate first, restart, and restore the previous service if switching fails."""
         with self._lifecycle_lock:
-            self._stop_requested.clear()
+            if self._stop_requested.is_set():
+                return False, "重载已取消"
             active_nodes = copy.deepcopy([n for n in nodes if n.enabled])
             was_running = self.is_running()
             owned_ports = set()
-            if was_running and (listen_ip == self.listen_ip or "0.0.0.0" in (listen_ip, self.listen_ip)):
+            addresses = (listen_ip, self.listen_ip)
+            shared_bind = (
+                listen_ip == self.listen_ip or "::" in addresses
+                or ("0.0.0.0" in addresses and all(":" not in ip for ip in addresses))
+            )
+            if was_running and shared_bind:
                 owned_ports = {n.local_port for n in self._active_nodes}
             ok, msg, config = self._prepare_config(active_nodes, listen_ip, auth_user, auth_pass, owned_ports)
             if not ok:
@@ -438,7 +594,7 @@ class XrayManager:
                 return False, "重载已取消"
 
             previous = (self._active_config, self._active_nodes, self.listen_ip, self.auth_credentials)
-            if was_running:
+            if self.process is not None:
                 ok, msg = self._stop_process()
                 if not ok:
                     return False, msg
@@ -453,28 +609,39 @@ class XrayManager:
 
     def stop(self) -> Tuple[bool, str]:
         """Stop Xray process cleanly."""
-        self._stop_requested.set()
-        with self._lifecycle_lock:
-            return self._stop_process()
+        with self._stop_lock:
+            self._stop_requested.set()
+            with self._lifecycle_lock:
+                try:
+                    return self._stop_process()
+                finally:
+                    if not self._closed:
+                        self._stop_requested.clear()
+
+    def close(self) -> Tuple[bool, str]:
+        """Stop this manager and reject any start queued during shutdown."""
+        self._closed = True
+        result = self.stop()
+        if result[0] and self._job_cleanup is not None:
+            self._job_cleanup()
+            self._job_handle = None
+        return result
 
     def _stop_process(self) -> Tuple[bool, str]:
-        self._running = False
         proc = self.process
         if not proc:
             return True, "服务未运行"
 
         try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=1.0)
+            _terminate_process(proc)
+            if self._process_cleanup is not None:
+                self._process_cleanup.detach()
+                self._process_cleanup = None
             self.process = None
             self.active_mappings = []
             self._active_config = None
             self._active_nodes = []
+            self.auth_credentials = None
             self.generation += 1
             self._log("Xray 服务已停止。")
             return True, "代理服务已停止"
@@ -486,9 +653,7 @@ class XrayManager:
         return proc is not None and proc.poll() is None
 
     def _build_proxy_url(self, local_port: int, host: Optional[str] = None) -> str:
-        target_host = host or self.listen_ip or "127.0.0.1"
-        if target_host in ("0.0.0.0", "::", ""):
-            target_host = "127.0.0.1"
+        target_host = format_proxy_host(host or self.listen_ip)
         if self.auth_credentials:
             u, p = self.auth_credentials
             return f"http://{quote(u, safe='')}:{quote(p, safe='')}@{target_host}:{local_port}"
@@ -513,22 +678,20 @@ class XrayManager:
         sess.trust_env = False
 
         try:
-            resp = sess.get(test_url, proxies=proxies, timeout=timeout, allow_redirects=False)
-            if 200 <= resp.status_code < 400:
-                cost_ms = max(1, int((time.perf_counter() - start_t) * 1000))
-                return True, cost_ms, "OK"
-            return False, None, f"HTTP {resp.status_code}"
+            with sess.get(
+                test_url, proxies=proxies, timeout=timeout, allow_redirects=False, stream=True,
+                hooks={"response": discard_redirect_body},
+            ) as resp:
+                if 200 <= resp.status_code < 400:
+                    cost_ms = max(1, int((time.perf_counter() - start_t) * 1000))
+                    return True, cost_ms, "OK"
+                return False, None, f"HTTP {resp.status_code}"
         except requests.exceptions.Timeout:
             return False, None, "连接超时"
         except requests.exceptions.SSLError:
             return False, None, "TLS 握手失败"
         except Exception as e:
-            err_str = str(e)
-            if "Connection refused" in err_str or "10061" in err_str:
-                return False, None, "本地端口未监听"
-            if "407" in err_str:
-                return False, None, "代理鉴权失败 (407)"
-            return False, None, "连接失败"
+            return False, None, _local_proxy_error(e) or "连接失败"
         finally:
             if own_session:
                 sess.close()
@@ -539,6 +702,7 @@ class XrayManager:
         test_url: str = "https://cp.cloudflare.com/generate_204",
         timeout: float = 5.0,
         progress_cb: Optional[Callable[[int, int, ProxyNode], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[int, Tuple[bool, Optional[int], str]]:
         """Concurrently test latency for all enabled nodes."""
         results: Dict[int, Tuple[bool, Optional[int], str]] = {}
@@ -553,6 +717,8 @@ class XrayManager:
         done_counter = [0]
 
         def _worker(item) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             node, port, key, proxy_url = item
             ok, lat, msg = self.test_single_proxy(port, test_url=test_url, timeout=timeout, proxy_url=proxy_url)
             current = (generation == self.generation and node.enabled
@@ -562,10 +728,9 @@ class XrayManager:
                 node.last_error = "" if ok else msg
             with lock:
                 done_counter[0] += 1
-                done_now = done_counter[0]
                 results[port] = (ok, lat, msg)
-            if progress_cb:
-                progress_cb(done_now, total, node)
+                if progress_cb:
+                    progress_cb(done_counter[0], total, node)
 
         with ThreadPoolExecutor(max_workers=min(16, total)) as pool:
             list(pool.map(_worker, active_nodes))
@@ -583,6 +748,8 @@ class XrayManager:
             # Primary: Cloudflare trace (fast, returns both IP and 2-letter country code)
             try:
                 resp = sess.get("https://cp.cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=timeout)
+                if resp.status_code == 407:
+                    return False, ""
                 if resp.status_code == 200 and "ip=" in resp.text:
                     kv = {}
                     for line in resp.text.splitlines():
@@ -593,8 +760,9 @@ class XrayManager:
                     loc = kv.get("loc", "")
                     if ip:
                         return True, f"{ip} ({loc})" if loc else ip
-            except Exception:
-                pass
+            except requests.RequestException as exc:
+                if _local_proxy_error(exc):
+                    return False, ""
 
             # Fallback: ipify
             try:
@@ -612,6 +780,7 @@ class XrayManager:
         self,
         nodes: List[ProxyNode],
         progress_cb: Optional[Callable[[int, int, ProxyNode], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
         generation = self.generation
         active_nodes = [(n, n.local_port, n.connection_key(), self._build_proxy_url(n.local_port))
@@ -624,6 +793,8 @@ class XrayManager:
         done_counter = [0]
 
         def _worker(item) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             node, port, key, proxy_url = item
             ok, ip_info = self.probe_exit_ip(port, proxy_url=proxy_url)
             if (generation == self.generation and node.enabled
@@ -631,9 +802,8 @@ class XrayManager:
                 node.exit_ip = ip_info if ok else ""
             with lock:
                 done_counter[0] += 1
-                done_now = done_counter[0]
-            if progress_cb:
-                progress_cb(done_now, total, node)
+                if progress_cb:
+                    progress_cb(done_counter[0], total, node)
 
         with ThreadPoolExecutor(max_workers=min(12, total)) as pool:
             list(pool.map(_worker, active_nodes))
