@@ -559,6 +559,8 @@ class ShadowsocksNode(ProxyNode):
         if self.enabled and not self.method:
             raise ValueError("Shadowsocks 缺少加密方式 (method / cipher)")
         self.password = password
+        if self.enabled and not self.password:
+            raise ValueError("Shadowsocks 缺少密码")
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -1063,6 +1065,8 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
     name = str(p.get("name", "")).strip()
     server = str(p.get("server", "")).strip()
     port = _parse_proxy_port(p.get("port", 443), "Clash")
+    password_value = p.get("password")
+    password = "" if password_value is None else str(password_value)
     if ptype in ("vmess", "vless", "trojan"):
         tr = _extract_clash_transport(p)
 
@@ -1110,12 +1114,11 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
         )
     if ptype == "trojan":
         security = "reality" if tr["has_reality"] else ("tls" if _clash_tls_enabled(p.get("tls", True)) else "none")
-        password = p.get("password")
         return TrojanNode(
             name=name,
             server=server,
             port=port,
-            password="" if password is None else str(password),
+            password=password,
             network=tr["network"],
             header_type=tr["header_type"],
             security=security,
@@ -1137,16 +1140,17 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             server=server,
             port=port,
             method=str(p.get("cipher") or ""),
-            password=str(p.get("password", "")),
+            password=password,
         )
     if ptype in ("socks", "socks5"):
         if _clash_tls_enabled(p.get("tls")) or p.get("fingerprint"):
             raise ValueError("暂不支持带 TLS 或证书指纹锁定的 Clash SOCKS5 节点")
+        username = p.get("username")
         return SocksNode(
             name=name,
             server=server,
             port=port,
-            user=str(p.get("username", "")),
-            password=str(p.get("password", "")),
+            user="" if username is None else str(username),
+            password=password,
         )
     raise ValueError(f"Unsupported clash proxy type: {ptype}")

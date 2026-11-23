@@ -122,6 +122,46 @@ def test_placeholder_nodes_can_omit_credentials(protocol):
     assert not node.enabled
 
 
+@pytest.mark.parametrize("method", ["aes-256-gcm", "2022-blake3-aes-128-gcm", "none"])
+@pytest.mark.parametrize("source", ["share", "clash_null", "clash_empty"])
+def test_empty_shadowsocks_password_is_rejected_without_losing_valid_nodes(method, source):
+    if source == "share":
+        content = f"trojan://valid@example.net:443#good\nss://{method}:@example.com:8388"
+    else:
+        password = "null" if source == "clash_null" else "''"
+        content = ("proxies: [{type: trojan, name: good, server: example.net, password: valid}, "
+                   f"{{type: ss, server: example.com, port: 8388, cipher: {method}, password: {password}}}]")
+    nodes, errors = parse_subscription_content(content)
+    assert [node.name for node in nodes] == ["good"]
+    assert len(errors) == 1 and "Shadowsocks 缺少密码" in errors[0]
+
+
+@pytest.mark.parametrize("username,password", [(None, None), ("", None), ("user", None), (0, 0), ("None", "None")])
+def test_clash_socks_credentials_distinguish_null_from_literal_values(username, password):
+    proxy = {"type": "socks5", "server": "example.com", "port": 1080,
+             "username": username, "password": password}
+    node = parse_clash_proxy(proxy)
+    server = node.to_outbound("test")["settings"]["servers"][0]
+    if username is None or username == "":
+        assert "users" not in server
+    else:
+        assert server["users"] == [{"user": str(username), "pass": "" if password is None else str(password)}]
+    assert node_from_dict(node.to_dict()).to_outbound("test") == node.to_outbound("test")
+
+
+@pytest.mark.parametrize("password", [0, "None", " pass "])
+def test_clash_shadowsocks_preserves_nonempty_passwords(password):
+    node = parse_clash_proxy({"type": "ss", "server": "example.com", "port": 8388,
+                              "cipher": "aes-256-gcm", "password": password})
+    assert node.password == str(password)
+
+
+def test_shadowsocks_placeholder_can_omit_password():
+    node = parse_clash_proxy({"type": "ss", "server": "127.0.0.1", "port": 1,
+                              "cipher": "aes-256-gcm", "password": None})
+    assert not node.enabled and node.password == ""
+
+
 def test_empty_clash_http_opts_leaves_plain_tcp():
     proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "network": "tcp", "http-opts": {}}
     stream = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]

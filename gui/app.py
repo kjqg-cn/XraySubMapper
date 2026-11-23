@@ -53,6 +53,7 @@ from core.parser import ProxyNode
 from core.subscription import fetch_subscription_with_meta, parse_subscription_content
 from core.xray_manager import XrayManager, format_proxy_host
 from .icons import build_app_logo_icon, clear_icon_caches, icon
+from .single_instance import GUI_MUTEX_NAME, GuiInstanceLock, activate_existing_window, activation_message_id
 from .widgets import (
     COL_ENABLED,
     COL_INDEX,
@@ -70,6 +71,8 @@ from .widgets import (
     ProxySettingsDialog,
     ToastNotification,
 )
+
+GUI_WINDOW_TITLE = "XraySubMapper · 多节点多端口混合代理工作台 (HTTP + SOCKS5)"
 
 GLOBAL_QSS = """
 QMainWindow {
@@ -377,7 +380,7 @@ class ProbeTask:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("XraySubMapper · 多节点多端口混合代理工作台 (HTTP + SOCKS5)")
+        self.setWindowTitle(GUI_WINDOW_TITLE)
         self.setWindowIcon(build_app_logo_icon(active=False))
         self.setAcceptDrops(True)
 
@@ -937,10 +940,22 @@ class MainWindow(QMainWindow):
             self._bring_to_front()
 
     def _bring_to_front(self) -> None:
+        if self._closing:
+            return
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
         self.show()
         self.activateWindow()
         self.raise_()
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32" and eventType == b"windows_generic_MSG":
+            from ctypes.wintypes import MSG
+
+            activation = activation_message_id()
+            if activation and MSG.from_address(int(message)).message == activation:
+                QTimer.singleShot(0, self._bring_to_front)
+                return True, 0
+        return super().nativeEvent(eventType, message)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1092,8 +1107,9 @@ class MainWindow(QMainWindow):
 
     def _assign_ports(self, reset_pinned: bool = False, *, replace_unreadable: bool = False) -> None:
         start_p = self._get_start_port()
-        self.settings["start_port"] = start_p
-        self._report_cache_save(save_settings(self.settings, replace_unreadable=replace_unreadable))
+        if replace_unreadable or start_p != self.settings.get("start_port"):
+            self.settings["start_port"] = start_p
+            self._report_cache_save(save_settings(self.settings, replace_unreadable=replace_unreadable))
 
         if reset_pinned:
             for n in self.nodes:
@@ -2100,36 +2116,50 @@ def run_gui() -> None:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication.instance() or QApplication(sys.argv)
-    app.aboutToQuit.connect(clear_icon_caches)
-    app.setStyle("Fusion")
-    base_font = QFont("Microsoft YaHei UI", 9)
-    base_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
-    base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-    app.setFont(base_font)
-    app.setStyleSheet(GLOBAL_QSS)
-    app.setWindowIcon(build_app_logo_icon(active=False))
-    win = MainWindow()
-    win.show()
-    # Guard against parent launchers passing STARTUPINFO.wShowWindow = SW_HIDE (0) on Windows
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes.wintypes import BOOL, HWND
+    instance_lock = GuiInstanceLock(GUI_MUTEX_NAME)
+    try:
+        primary = instance_lock.acquire()
+    except OSError as exc:
+        QMessageBox.critical(None, "启动失败 - XraySubMapper", f"无法确认工作台运行状态，请稍后重试。\n{exc}")
+        sys.exit(1)
+    if not primary:
+        if not activate_existing_window(GUI_WINDOW_TITLE):
+            QMessageBox.information(None, "XraySubMapper 已在运行", "请从任务栏或系统托盘打开已有工作台；若正在启动，请稍候。")
+        return
 
-            user32 = ctypes.windll.user32
-            user32.IsWindowVisible.argtypes = [HWND]
-            user32.IsWindowVisible.restype = BOOL
-            user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
-            user32.ShowWindow.restype = BOOL
-            user32.SetForegroundWindow.argtypes = [HWND]
-            user32.SetForegroundWindow.restype = BOOL
-            hwnd = int(win.winId())
-            if not user32.IsWindowVisible(hwnd):
-                user32.ShowWindow(hwnd, 5)  # SW_SHOW
-            user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-    sys.exit(app.exec())
+    try:
+        app.aboutToQuit.connect(clear_icon_caches)
+        app.setStyle("Fusion")
+        base_font = QFont("Microsoft YaHei UI", 9)
+        base_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        app.setFont(base_font)
+        app.setStyleSheet(GLOBAL_QSS)
+        app.setWindowIcon(build_app_logo_icon(active=False))
+        win = MainWindow()
+        win.show()
+        # Guard against parent launchers passing STARTUPINFO.wShowWindow = SW_HIDE (0) on Windows
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes.wintypes import BOOL, HWND
+
+                user32 = ctypes.windll.user32
+                user32.IsWindowVisible.argtypes = [HWND]
+                user32.IsWindowVisible.restype = BOOL
+                user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+                user32.ShowWindow.restype = BOOL
+                user32.SetForegroundWindow.argtypes = [HWND]
+                user32.SetForegroundWindow.restype = BOOL
+                hwnd = int(win.winId())
+                if not user32.IsWindowVisible(hwnd):
+                    user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        sys.exit(app.exec())
+    finally:
+        instance_lock.close()
 
 
 if __name__ == "__main__":

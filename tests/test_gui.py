@@ -1,11 +1,13 @@
 import base64
 import copy
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import warnings
 from unittest.mock import Mock
 
@@ -13,12 +15,14 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QSpinBox
 
 from core import config
 from core.config import CacheSaveResult, DEFAULT_SETTINGS
 from gui.app import MainWindow, ProbeTask
-from gui.widgets import ProxySettingsDialog, extract_region_and_clean_name
+from gui.single_instance import GuiInstanceLock, activation_message_id
+from gui.widgets import COL_ENABLED, ProxySettingsDialog, extract_region_and_clean_name
 
 
 @pytest.fixture(scope="module")
@@ -113,6 +117,41 @@ def test_window_autosave_keeps_unreadable_settings(window, protected_settings):
         window._save_window_state()
     assert path.read_bytes() == original
     assert not list(path.parent.glob("*.bak"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+@pytest.mark.parametrize("action", ["checkbox", "selected", "invert", "delete", "batch", "passed"])
+def test_node_edits_preserve_protected_settings_and_save_nodes(
+    window, application, protected_settings, make_node, monkeypatch, action,
+):
+    settings_path, original = protected_settings
+    nodes_path = settings_path.parent / "cached_nodes.json"
+    monkeypatch.setattr(config, "NODES_CACHE_FILE", str(nodes_path))
+    monkeypatch.setattr("gui.app.save_cached_nodes", config.save_cached_nodes)
+    window.nodes = [make_node("one", 10800), make_node("two", 10801)]
+    window.nodes[0].latency_ms, window.nodes[1].latency_ms = 42, -1
+    window.table_model.set_nodes(window.nodes)
+    window.table_view.selectRow(0)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always", RuntimeWarning)
+        if action == "checkbox":
+            window._on_table_clicked(window.proxy_model.index(0, COL_ENABLED))
+        elif action == "selected":
+            window._toggle_selected_rows()
+        elif action == "invert":
+            window._invert_selection()
+        elif action == "delete":
+            window._delete_selected_rows()
+        elif action == "batch":
+            window._batch_set_enabled(False)
+        else:
+            window._keep_only_passed_nodes()
+        application.processEvents()
+    assert not recorded
+    assert settings_path.read_bytes() == original
+    assert not list(settings_path.parent.glob("app_settings.json.*.bak"))
+    assert [node.to_dict() for node in config.load_cached_nodes()] == [node.to_dict() for node in window.nodes]
+    assert all(call.args[1] != "error" for call in window._notify.call_args_list)
 
 
 @pytest.mark.parametrize("edit", ["port", "auth", "listen"])
@@ -360,12 +399,14 @@ def test_closing_with_service_transition_waits_off_gui_thread(window, applicatio
 @pytest.mark.parametrize("force_quit", [False, True])
 def test_run_gui_exits_after_hidden_window_closes(running, force_quit):
     # Run the production event loop in an isolated process.
+    mutex_name = rf"Local\XraySubMapper.Test.{uuid.uuid4().hex}"
     code = f"""
 from unittest.mock import Mock
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 import gui.app as gui
 
+gui.GUI_MUTEX_NAME = {mutex_name!r}
 gui.load_settings = lambda: {DEFAULT_SETTINGS!r}
 gui.load_cached_nodes = list
 gui.save_settings = Mock(return_value=gui.CacheSaveResult())
@@ -400,6 +441,7 @@ gui.run_gui()
 
 
 def test_close_prompt_reentry_and_tray_quit_cleanup_once():
+    mutex_name = rf"Local\XraySubMapper.Test.{uuid.uuid4().hex}"
     code = f"""
 from unittest.mock import Mock
 from PySide6.QtCore import QCoreApplication, QTimer
@@ -407,6 +449,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 import gui.app as gui
 
+gui.GUI_MUTEX_NAME = {mutex_name!r}
 gui.load_settings = lambda: {DEFAULT_SETTINGS!r}
 gui.load_cached_nodes = list
 gui.save_settings = Mock(return_value=gui.CacheSaveResult())
@@ -455,6 +498,65 @@ gui.run_gui()
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert b"prompts 1 closed 1" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows GUI singleton")
+def test_gui_initialization_failure_releases_instance_lock(application, monkeypatch):
+    import gui.app as gui
+
+    name = rf"Local\XraySubMapper.Test.{uuid.uuid4().hex}"
+    monkeypatch.setattr(gui, "GUI_MUTEX_NAME", name)
+    monkeypatch.setattr(gui, "MainWindow", Mock(side_effect=RuntimeError("initialization failed")))
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        gui.run_gui()
+    replacement = GuiInstanceLock(name)
+    try:
+        assert replacement.acquire()
+    finally:
+        replacement.close()
+
+
+def test_gui_mutex_failure_is_reported_before_window_initialization(application, monkeypatch):
+    import gui.app as gui
+
+    lock = Mock()
+    lock.acquire.side_effect = OSError("mutex unavailable")
+    critical, constructor = Mock(), Mock()
+    monkeypatch.setattr(gui, "GuiInstanceLock", lambda name: lock)
+    monkeypatch.setattr(gui, "MainWindow", constructor)
+    monkeypatch.setattr(gui.QMessageBox, "critical", critical)
+    with pytest.raises(SystemExit) as result:
+        gui.run_gui()
+    assert result.value.code == 1 and "mutex unavailable" in critical.call_args.args[2]
+    constructor.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows native activation message")
+@pytest.mark.parametrize("closing", [False, True])
+def test_activation_restores_window_unless_shutdown_has_started(window, application, closing):
+    from ctypes.wintypes import MSG
+
+    message = MSG()
+    message.message = activation_message_id()
+    window.setWindowState(Qt.WindowState.WindowMinimized)
+    window.hide()
+    window._closing = closing
+    try:
+        assert window.nativeEvent(b"windows_generic_MSG", ctypes.addressof(message)) == (True, 0)
+        application.processEvents()
+        assert window.isVisible() is not closing
+        if not closing:
+            assert not window.windowState() & Qt.WindowState.WindowMinimized
+    finally:
+        window._closing = False
+
+
+def test_paste_shortcut_protects_numeric_editor(window, application, make_node, monkeypatch):
+    editor = QSpinBox(window)
+    monkeypatch.setattr(QApplication, "focusWidget", lambda: editor)
+    application.clipboard().setText(make_node().raw_link)
+    window._smart_paste_shortcut()
+    assert not window.nodes
 
 
 def test_incomplete_auth_cannot_be_saved(window, monkeypatch):
