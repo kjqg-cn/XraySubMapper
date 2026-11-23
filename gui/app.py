@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+if sys.platform == "win32":
+    from ctypes.wintypes import MSG as _WIN32_MSG
+else:
+    _WIN32_MSG = None
+
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QCloseEvent,
@@ -948,11 +953,9 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def nativeEvent(self, eventType, message):
-        if sys.platform == "win32" and eventType == b"windows_generic_MSG":
-            from ctypes.wintypes import MSG
-
+        if _WIN32_MSG is not None and eventType == b"windows_generic_MSG":
             activation = activation_message_id()
-            if activation and MSG.from_address(int(message)).message == activation:
+            if activation and _WIN32_MSG.from_address(int(message)).message == activation:
                 QTimer.singleShot(0, self._bring_to_front)
                 return True, 0
         return super().nativeEvent(eventType, message)

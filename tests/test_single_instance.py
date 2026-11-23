@@ -50,6 +50,25 @@ def test_existing_instance_is_rejected_across_processes(held_mutex):
         duplicate.close()
 
 
+def test_access_denied_mutex_is_treated_as_existing_instance(monkeypatch):
+    import ctypes
+    from types import SimpleNamespace
+    import gui.single_instance as mod
+
+    def create_denied(*args):
+        ctypes.set_last_error(mod._ERROR_ACCESS_DENIED)
+        return 0
+
+    fake_kernel32 = SimpleNamespace(
+        CreateMutexExW=create_denied,
+        CloseHandle=lambda handle: 1,
+    )
+    monkeypatch.setattr(mod.ctypes, "WinDLL", lambda *args, **kwargs: fake_kernel32)
+    lock = GuiInstanceLock(r"Local\XraySubMapper.Test.AccessDenied")
+    assert lock.acquire() is False
+    assert lock._handle is None
+
+
 @pytest.mark.parametrize("termination", ["normal", "killed"])
 def test_mutex_is_released_after_owner_exits(held_mutex, termination):
     name, process = held_mutex

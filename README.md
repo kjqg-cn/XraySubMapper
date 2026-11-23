@@ -135,6 +135,7 @@ XraySubMapper/
 │   └── config.py            # DPAPI 加密配置与节点缓存持久化
 ├── gui/
 │   ├── app.py               # PySide6 主窗口、热重载与托盘管理
+│   ├── single_instance.py   # Windows 桌面单实例互斥与已有窗口唤醒
 │   ├── widgets.py           # Model/FilterProxy、抗锯齿自绘委托与悬浮 Toast
 │   └── icons.py             # 多分辨率矢量 SVG 图标渲染器
 └── tests/
@@ -144,6 +145,7 @@ XraySubMapper/
     ├── test_manager.py      # 生命周期、回退与探测一致性
     ├── test_config.py       # 敏感缓存加密及迁移
     ├── test_cli.py          # 测速导出回归
+    ├── test_single_instance.py # Windows 桌面单实例互斥与激活回归
     └── test_gui.py          # 异步配置、复制与探测结果回归
 ```
 

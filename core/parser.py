@@ -1060,13 +1060,16 @@ def _clash_tls_enabled(value: Any) -> bool:
     raise ValueError("Clash tls 配置无效，请使用布尔值")
 
 
+def _clash_str(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
 def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
-    ptype = str(p.get("type", "")).lower()
-    name = str(p.get("name", "")).strip()
-    server = str(p.get("server", "")).strip()
+    ptype = _clash_str(p.get("type")).lower()
+    name = _clash_str(p.get("name")).strip()
+    server = _clash_str(p.get("server")).strip()
     port = _parse_proxy_port(p.get("port", 443), "Clash")
-    password_value = p.get("password")
-    password = "" if password_value is None else str(password_value)
+    password = _clash_str(p.get("password"))
     if ptype in ("vmess", "vless", "trojan"):
         tr = _extract_clash_transport(p)
 
@@ -1145,12 +1148,11 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
     if ptype in ("socks", "socks5"):
         if _clash_tls_enabled(p.get("tls")) or p.get("fingerprint"):
             raise ValueError("暂不支持带 TLS 或证书指纹锁定的 Clash SOCKS5 节点")
-        username = p.get("username")
         return SocksNode(
             name=name,
             server=server,
             port=port,
-            user="" if username is None else str(username),
+            user=_clash_str(p.get("username")),
             password=password,
         )
     raise ValueError(f"Unsupported clash proxy type: {ptype}")

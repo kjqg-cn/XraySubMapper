@@ -162,6 +162,15 @@ def test_shadowsocks_placeholder_can_omit_password():
     assert not node.enabled and node.password == ""
 
 
+def test_clash_null_server_is_disabled_and_null_name_uses_default():
+    placeholder = parse_clash_proxy({"type": "socks5", "name": None, "server": None, "port": 1080})
+    assert placeholder.server == "" and not placeholder.enabled
+    node = parse_clash_proxy({"type": "socks5", "name": None, "server": "example.com", "port": 1080})
+    assert node.name == "socks-example.com:1080" and node.enabled
+    numeric = parse_clash_proxy({"type": "socks5", "name": 0, "server": "example.com", "port": 1080})
+    assert numeric.name == "0"
+
+
 def test_empty_clash_http_opts_leaves_plain_tcp():
     proxy = {"type": "vless", "server": "example.com", "uuid": UUID, "network": "tcp", "http-opts": {}}
     stream = parse_clash_proxy(proxy).to_outbound("t")["streamSettings"]

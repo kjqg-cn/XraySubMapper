@@ -311,13 +311,24 @@ class NodeFilterProxyModel(QSortFilterProxyModel):
         self.setSortRole(ROLE_SORT)
         self.setDynamicSortFilter(True)
 
+    def _apply_filter_change(self, attr: str, value: str) -> None:
+        if hasattr(self, "beginFilterChange") and hasattr(self, "endFilterChange"):
+            self.beginFilterChange()
+            setattr(self, attr, value)
+            direction = getattr(QSortFilterProxyModel, "Direction", None)
+            if direction is not None:
+                self.endFilterChange(direction.Rows)
+            else:
+                self.endFilterChange()
+        else:
+            setattr(self, attr, value)
+            self.invalidateFilter()
+
     def set_search_query(self, text: str) -> None:
-        self.search_query = text.strip().lower()
-        self.invalidateFilter()
+        self._apply_filter_change("search_query", text.strip().lower())
 
     def set_proto_filter(self, proto: str) -> None:
-        self.proto_filter = proto.lower()
-        self.invalidateFilter()
+        self._apply_filter_change("proto_filter", proto.lower())
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         model: NodeTableModel = self.sourceModel()  # type: ignore[assignment]

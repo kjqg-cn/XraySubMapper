@@ -6,6 +6,7 @@ from typing import Optional
 
 GUI_MUTEX_NAME = r"Local\XraySubMapper.Desktop.Gui"
 _ACTIVATION_MESSAGE = "XraySubMapper.Desktop.Activate"
+_ERROR_ACCESS_DENIED = 5
 _ERROR_ALREADY_EXISTS = 183
 _SYNCHRONIZE = 0x00100000
 
@@ -33,6 +34,8 @@ class GuiInstanceLock:
         handle = create(None, self.name, 0, _SYNCHRONIZE)
         error = ctypes.get_last_error()
         if not handle:
+            if error == _ERROR_ACCESS_DENIED:
+                return False
             raise ctypes.WinError(error)
         if error == _ERROR_ALREADY_EXISTS:
             close(handle)
