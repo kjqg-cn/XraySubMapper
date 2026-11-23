@@ -34,13 +34,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QSystemTrayIcon,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -74,6 +74,7 @@ from .widgets import (
     NodeTableModel,
     PasteImportDialog,
     ProxySettingsDialog,
+    RoundedMenu,
     ToastNotification,
 )
 
@@ -84,7 +85,6 @@ QMainWindow {
     background-color: #F8FAFC;
 }
 QWidget {
-    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
     color: #0F172A;
 }
 QFrame#Card {
@@ -338,27 +338,37 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
 }
 
-/* Context Menu */
+/* Context Menu: only translucent RoundedMenu gets border-radius; native QLineEdit menus stay crisp square */
 QMenu {
     background-color: #FFFFFF;
-    border: 1px solid #E2E8F0;
-    border-radius: 8px;
+    border: 1px solid #CBD5E1;
+    border-radius: 0px;
     padding: 5px;
+}
+QMenu[rounded="true"] {
+    border-radius: 10px;
 }
 QMenu::item {
     padding: 6px 24px 6px 12px;
-    border-radius: 5px;
-    font-size: 13px;
+    border-radius: 6px;
+    font-size: 9.5pt;
     color: #1E293B;
 }
 QMenu::item:selected {
     background-color: #EFF6FF;
     color: #1D4ED8;
 }
+QMenu::item:disabled {
+    color: #94A3B8;
+    background-color: transparent;
+}
+QMenu::icon {
+    padding-left: 8px;
+}
 QMenu::separator {
     height: 1px;
-    background: #F1F5F9;
-    margin: 4px 6px;
+    background: #E2E8F0;
+    margin: 4px 8px;
 }
 """
 
@@ -388,6 +398,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(GUI_WINDOW_TITLE)
         self.setWindowIcon(build_app_logo_icon(active=False))
         self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
         with warnings.catch_warnings(record=True) as cache_warnings:
             warnings.simplefilter("always", RuntimeWarning)
@@ -448,6 +459,7 @@ class MainWindow(QMainWindow):
                 self, "缓存读取提示",
                 details + "\n\n读取失败的原文件会保留。主动导入、清空或保存设置时会先备份。",
             ))
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -608,7 +620,11 @@ class MainWindow(QMainWindow):
         self.inp_start_port = QLineEdit(str(int(self.settings.get("start_port", 10800))))
         self.inp_start_port.setValidator(QIntValidator(1024, 65000, self))
         self.inp_start_port.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.inp_start_port.setFont(QFont("Cascadia Mono", 9, QFont.Weight.Bold))
+        port_font = QFont("Cascadia Mono", 9, QFont.Weight.Bold)
+        port_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        port_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        self.inp_start_port.setFont(port_font)
+        self.inp_start_port.setStyleSheet('QLineEdit { font-family: "Cascadia Mono", "Consolas", monospace; font-weight: bold; }')
         self.inp_start_port.setFixedWidth(78)
         self.inp_start_port.editingFinished.connect(self._on_start_port_edited)
         row_ctrl.addWidget(self.inp_start_port)
@@ -621,7 +637,7 @@ class MainWindow(QMainWindow):
         btn_rearrange.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_rearrange.clicked.connect(lambda: self._rearrange_ports_clicked(reset_pinned=False))
 
-        rearrange_menu = QMenu(btn_rearrange)
+        rearrange_menu = RoundedMenu(btn_rearrange)
         act_keep_pin = rearrange_menu.addAction("顺延重排 (保留手动锁定的端口)")
         act_keep_pin.triggered.connect(lambda: self._rearrange_ports_clicked(reset_pinned=False))
         act_reset_pin = rearrange_menu.addAction("强制重排全部 (解除所有端口锁定)")
@@ -653,7 +669,7 @@ class MainWindow(QMainWindow):
         self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export.clicked.connect(lambda: self._copy_proxies_bulk("url", only_passed=False))
 
-        export_menu = QMenu(self.btn_export)
+        export_menu = RoundedMenu(self.btn_export)
         export_menu.addAction("复制 HTTP 代理列表 (http://ip:port)", lambda: self._copy_proxies_bulk("url", False))
         export_menu.addAction("复制 SOCKS5 代理列表 (socks5://ip:port)", lambda: self._copy_proxies_bulk("socks5", False))
         export_menu.addAction("复制 IP:Port 列表", lambda: self._copy_proxies_bulk("hostport", False))
@@ -774,6 +790,10 @@ class MainWindow(QMainWindow):
         self.table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         hdr = self.table_view.horizontalHeader()
+        hdr_font = QFont("Microsoft YaHei UI", 9, QFont.Weight.Bold)
+        hdr_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        hdr_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        hdr.setFont(hdr_font)
         hdr.setHighlightSections(False)
         hdr.setSortIndicatorShown(True)
         hdr.setSortIndicator(COL_INDEX, Qt.SortOrder.AscendingOrder)
@@ -866,9 +886,13 @@ class MainWindow(QMainWindow):
         self.txt_console = QPlainTextEdit()
         self.txt_console.setReadOnly(True)
         self.txt_console.setMaximumBlockCount(500)
-        self.txt_console.setFont(QFont("Cascadia Mono", 9))
+        console_font = QFont("Cascadia Mono", 9)
+        console_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        console_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        self.txt_console.setFont(console_font)
         self.txt_console.setStyleSheet(
-            "QPlainTextEdit { background: #0F172A; color: #E2E8F0; border: none; padding: 2px; }"
+            'QPlainTextEdit { background: #0F172A; color: #E2E8F0; border: none; padding: 2px; '
+            'font-family: "Cascadia Mono", "Consolas", monospace; font-size: 9pt; }'
         )
         self.txt_console.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.txt_console.customContextMenuRequested.connect(self._show_console_context_menu)
@@ -924,7 +948,7 @@ class MainWindow(QMainWindow):
         tray = QSystemTrayIcon(build_app_logo_icon(False), self)
         tray.setToolTip("XraySubMapper · 服务未启动")
 
-        menu = QMenu(self)
+        menu = RoundedMenu(self)
         act_show = menu.addAction("显示主工作台")
         act_show.triggered.connect(self._bring_to_front)
         self.act_tray_toggle = menu.addAction("启动映射服务")
@@ -959,6 +983,12 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self._bring_to_front)
                 return True, 0
         return super().nativeEvent(eventType, message)
+
+    def mousePressEvent(self, event) -> None:
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QLineEdit, QPlainTextEdit)):
+            fw.clearFocus()
+        super().mousePressEvent(event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1174,7 +1204,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _show_recent_urls_menu(self) -> None:
         recent = self.settings.get("recent_urls", [])
-        menu = QMenu(self)
+        menu = RoundedMenu(self)
         if not recent:
             act_empty = menu.addAction("暂无历史订阅记录")
             act_empty.setEnabled(False)
@@ -1207,6 +1237,8 @@ class MainWindow(QMainWindow):
 
         request = object()
         self._fetch_request = request
+        if QApplication.focusWidget() is self.btn_fetch:
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
         self.btn_fetch.setEnabled(False)
         self.btn_fetch.setText(" 正在拉取...")
 
@@ -1492,7 +1524,7 @@ class MainWindow(QMainWindow):
             self.table_view.selectRow(idx.row())
         node = self.nodes[src_row]
 
-        menu = QMenu(self)
+        menu = RoundedMenu(self)
         if node.enabled and node.local_port > 0 and not self._service_busy and not self._has_unapplied_changes():
             url_str = self._format_node_proxy_line(node, "url")
             socks_str = self._format_node_proxy_line(node, "socks5")
@@ -1706,6 +1738,8 @@ class MainWindow(QMainWindow):
     def _set_service_busy(self, busy: bool) -> None:
         self._service_busy = busy
         if busy:
+            if QApplication.focusWidget() in (self.btn_service, self.btn_reload_dirty):
+                self.setFocus(Qt.FocusReason.OtherFocusReason)
             self._cancel_probes()
         self.btn_service.setEnabled(not busy)
         self.btn_reload_dirty.setEnabled(not busy)
@@ -1852,6 +1886,8 @@ class MainWindow(QMainWindow):
             button, label = self.btn_probe_ip, "探测"
             operation = self.xray_mgr.probe_all_exit_ips
             progress, finished = self.bridge.exitIpProgress, self.bridge.exitIpFinished
+        if QApplication.focusWidget() is button:
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
         button.setEnabled(False)
         button.setText(f" {label} 0/{len(nodes)}")
 
@@ -1991,7 +2027,7 @@ class MainWindow(QMainWindow):
         self.txt_console.clear()
 
     def _show_console_context_menu(self, pos: QPoint) -> None:
-        menu = QMenu(self)
+        menu = RoundedMenu(self)
         has_sel = self.txt_console.textCursor().hasSelection()
         has_text = bool(self.txt_console.toPlainText())
 
@@ -2113,6 +2149,17 @@ def _set_windows_app_user_model_id() -> None:
             pass
 
 
+def _apply_app_fonts(app: QApplication) -> None:
+    """Apply smooth DirectWrite font settings globally, including per-class Qt system fonts."""
+    base_font = QFont("Microsoft YaHei UI", 9)
+    base_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+    base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    app.setFont(base_font)
+    for cls_name in ("QWidget", "QAbstractItemView", "QHeaderView", "QMenu", "QToolTip", "QMessageBox", "QComboBox"):
+        app.setFont(base_font, cls_name)
+    QToolTip.setFont(base_font)
+
+
 def run_gui() -> None:
     _set_windows_app_user_model_id()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -2133,11 +2180,8 @@ def run_gui() -> None:
     try:
         app.aboutToQuit.connect(clear_icon_caches)
         app.setStyle("Fusion")
-        base_font = QFont("Microsoft YaHei UI", 9)
-        base_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
-        base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        app.setFont(base_font)
         app.setStyleSheet(GLOBAL_QSS)
+        _apply_app_fonts(app)
         app.setWindowIcon(build_app_logo_icon(active=False))
         win = MainWindow()
         win.show()

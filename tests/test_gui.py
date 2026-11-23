@@ -559,6 +559,69 @@ def test_paste_shortcut_protects_numeric_editor(window, application, make_node, 
     assert not window.nodes
 
 
+def test_rounded_menu_uses_translucent_frameless_popup_and_smooth_font(window, application):
+    from PySide6.QtGui import QFont
+    from PySide6.QtWidgets import QMessageBox, QToolTip, QWidget
+    from gui.app import GLOBAL_QSS, _apply_app_fonts
+    from gui.widgets import RoundedMenu, _crisp_font
+
+    application.setStyleSheet(GLOBAL_QSS)
+    _apply_app_fonts(application)
+    menu = window.combo_listen.menu()
+    assert isinstance(menu, RoundedMenu)
+    assert menu.property("rounded") is True
+    assert menu.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert bool(menu.windowFlags() & Qt.WindowType.FramelessWindowHint)
+    assert bool(menu.windowFlags() & Qt.WindowType.NoDropShadowWindowHint)
+    assert menu.font().hintingPreference() == QFont.HintingPreference.PreferNoHinting
+    assert _crisp_font("Microsoft YaHei UI", 9.0).hintingPreference() == QFont.HintingPreference.PreferNoHinting
+    assert QToolTip.font().hintingPreference() == QFont.HintingPreference.PreferNoHinting
+    assert window.inp_start_port.font().hintingPreference() == QFont.HintingPreference.PreferNoHinting
+    assert window.txt_console.font().hintingPreference() == QFont.HintingPreference.PreferNoHinting
+    assert window.table_view.horizontalHeader().font().hintingPreference() == QFont.HintingPreference.PreferNoHinting
+    for root in (window, QMessageBox(window)):
+        root.ensurePolished()
+        for widget in [root, *root.findChildren(QWidget)]:
+            widget.ensurePolished()
+            assert widget.font().hintingPreference() == QFont.HintingPreference.PreferNoHinting, type(widget).__name__
+
+
+def test_service_toggle_does_not_move_focus_to_subscription_url(window, application):
+    window.show()
+    window.inp_url.setText("https://example.com/sub")
+    window.btn_service.setFocus()
+    application.processEvents()
+    window._set_service_busy(True)
+    application.processEvents()
+    try:
+        assert QApplication.focusWidget() is not window.inp_url
+        assert not window.inp_url.hasSelectedText()
+    finally:
+        window._set_service_busy(False)
+
+
+def test_clicking_blank_area_clears_line_edit_focus(window, application):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    window.show()
+    for editor in (window.inp_url, window.inp_start_port):
+        editor.setFocus()
+        application.processEvents()
+        assert editor.hasFocus()
+        press = QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress,
+            QPointF(4, 4),
+            QPointF(4, 4),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        window.mousePressEvent(press)
+        application.processEvents()
+        assert not editor.hasFocus()
+
+
 def test_incomplete_auth_cannot_be_saved(window, monkeypatch):
     warning = Mock()
     monkeypatch.setattr("gui.widgets.QMessageBox.warning", warning)

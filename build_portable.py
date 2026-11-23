@@ -86,31 +86,105 @@ def build() -> None:
         "tkinter",
         "unittest",
         "pydoc",
+        "setuptools",
+        "pkg_resources",
+        "distutils",
+        "_distutils_hack",
     ]
+
+    # Build via a tailored .spec so unused Qt software OpenGL / extra image plugins / non-zh/en translations
+    # are stripped before compression, reducing both EXE size and single-file startup extraction time.
+    spec_path = os.path.join(build_work_dir, "XraySubMapper.spec")
+    entry_script = os.path.join(ROOT_DIR, "main.py")
+    spec_content = f"""# -*- mode: python ; coding: utf-8 -*-
+
+_DROP_BINARIES = {{
+    "opengl32sw.dll",
+    "qdirect2d.dll",
+    "qtiff.dll",
+    "qjpeg.dll",
+    "qgif.dll",
+    "qwebp.dll",
+    "qwbmp.dll",
+    "qtga.dll",
+    "qicns.dll",
+    "qpdf.dll",
+    "qtvirtualkeyboardplugin.dll",
+    "qt6pdf.dll",
+    "qt6quick.dll",
+    "qt6qml.dll",
+    "qt6qmlmeta.dll",
+    "qt6qmlmodels.dll",
+    "qt6qmlworkerscript.dll",
+    "qt6opengl.dll",
+    "qt6virtualkeyboard.dll",
+}}
+
+def _keep_binary(entry):
+    name = entry[0].replace("\\\\", "/").rsplit("/", 1)[-1].lower()
+    return name not in _DROP_BINARIES
+
+def _keep_data(entry):
+    rel = entry[0].replace("\\\\", "/").lower()
+    if "/translations/" in rel and rel.endswith(".qm"):
+        base = rel.rsplit("/", 1)[-1]
+        return base.startswith(("qtbase_zh", "qtbase_en"))
+    return True
+
+a = Analysis(
+    [{entry_script!r}],
+    pathex=[],
+    binaries=[({xray_bin!r}, ".")],
+    datas=[],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes={excludes!r},
+    noarchive=False,
+    optimize=0,
+)
+a.binaries = [b for b in a.binaries if _keep_binary(b)]
+a.datas = [d for d in a.datas if _keep_data(d)]
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="XraySubMapper",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=[{ico_path!r}],
+)
+"""
+    os.makedirs(build_work_dir, exist_ok=True)
+    with open(spec_path, "w", encoding="utf-8") as f:
+        f.write(spec_content)
 
     cmd = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--noconfirm",
-        "--onefile",
-        "--noconsole",
-        "--name",
-        "XraySubMapper",
-        "--icon",
-        ico_path,
-        "--add-binary",
-        f"{xray_bin};.",
         "--distpath",
         release_dir,
         "--workpath",
         os.path.join(build_work_dir, "pyinstaller_work"),
-        "--specpath",
-        build_work_dir,
+        spec_path,
     ]
-    for mod in excludes:
-        cmd.extend(["--exclude-module", mod])
-    cmd.append(os.path.join(ROOT_DIR, "main.py"))
 
     print("[2/3] Running PyInstaller single-file portable build...")
     os.makedirs(release_dir, exist_ok=True)

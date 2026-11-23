@@ -16,14 +16,28 @@ import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
-
-import requests
 
 from .config import get_app_dir
 from .parser import ProxyNode
 from .subscription import discard_redirect_body
+
+if TYPE_CHECKING:
+    import requests
+
+
+def _get_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "requests":
+        return _get_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 MIN_XRAY_VERSION = (26, 11, 9)
@@ -786,16 +800,17 @@ class XrayManager:
         test_url: str = "https://cp.cloudflare.com/generate_204",
         timeout: float = 5.0,
         host: Optional[str] = None,
-        session: Optional[requests.Session] = None,
+        session: Optional["requests.Session"] = None,
         proxy_url: Optional[str] = None,
     ) -> Tuple[bool, Optional[int], str]:
         """Test a local HTTP proxy port over HTTPS CONNECT tunnel."""
+        req = _get_requests()
         proxy_url = proxy_url or self._build_proxy_url(local_port, host=host)
         proxies = {"http": proxy_url, "https": proxy_url}
         start_t = time.perf_counter()
 
         own_session = session is None
-        sess = session or requests.Session()
+        sess = session or req.Session()
         sess.trust_env = False
 
         try:
@@ -807,9 +822,9 @@ class XrayManager:
                     cost_ms = max(1, int((time.perf_counter() - start_t) * 1000))
                     return True, cost_ms, "OK"
                 return False, None, f"HTTP {resp.status_code}"
-        except requests.exceptions.Timeout:
+        except req.exceptions.Timeout:
             return False, None, "连接超时"
-        except requests.exceptions.SSLError:
+        except req.exceptions.SSLError:
             return False, None, "TLS 握手失败"
         except Exception as e:
             return False, None, _local_proxy_error(e) or "连接失败"
@@ -862,9 +877,10 @@ class XrayManager:
         self, local_port: int, timeout: float = 6.0, proxy_url: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Query outbound exit IP and country code through the mapped local HTTP proxy."""
+        req = _get_requests()
         proxy_url = proxy_url or self._build_proxy_url(local_port)
         proxies = {"http": proxy_url, "https": proxy_url}
-        with requests.Session() as sess:
+        with req.Session() as sess:
             sess.trust_env = False
             # Primary: Cloudflare trace (fast, returns both IP and 2-letter country code)
             try:
@@ -881,7 +897,7 @@ class XrayManager:
                         loc = kv.get("loc", "")
                         if ip:
                             return True, f"{ip} ({loc})" if loc else ip
-            except requests.RequestException as exc:
+            except req.RequestException as exc:
                 if _local_proxy_error(exc):
                     return False, ""
 

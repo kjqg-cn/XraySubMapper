@@ -354,7 +354,9 @@ def _crisp_font(family: str, pt_size: float, bold: bool = False) -> QFont:
     f = QFont(family)
     f.setPointSizeF(pt_size)
     f.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
-    f.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+    # PreferNoHinting enables smooth DirectWrite rendering on Windows HiDPI (125%/150%/200%);
+    # PreferDefaultHinting/PreferFullHinting fall back to legacy GDI hinting with jagged/broken CJK strokes.
+    f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     return f
 
@@ -437,6 +439,7 @@ class NodeTableDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
         rect = option.rect
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
@@ -684,6 +687,21 @@ class NodeTableDelegate(QStyledItemDelegate):
         painter.drawText(text_r, Qt.AlignmentFlag.AlignCenter, label)
 
 
+class RoundedMenu(QMenu):
+    """Unified translucent frameless popup menu so QSS border-radius renders true rounded corners on Windows."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setProperty("rounded", True)
+        self.setFont(_crisp_font("Microsoft YaHei UI", 9.5, bold=False))
+
+
 class MenuSelectButton(QToolButton):
     """
     Modern unified selector button matching split-action buttons ('顺延重排', '复制代理'):
@@ -718,7 +736,7 @@ class MenuSelectButton(QToolButton):
                 "QToolButton::menu-button { width: 18px; border-top-right-radius: 6px; border-bottom-right-radius: 6px; }"
             )
 
-        self._menu = QMenu(self)
+        self._menu = RoundedMenu(self)
         self.setMenu(self._menu)
         self.clicked.connect(self.showMenu)
         self._rebuild_menu_and_label()
@@ -756,9 +774,7 @@ class MenuSelectButton(QToolButton):
             is_sel = opt_val == self._current_value
             act = self._menu.addAction(check_icon if is_sel else blank_icon, opt_lbl)
             if is_sel:
-                f = act.font()
-                f.setWeight(QFont.Weight.Bold)
-                act.setFont(f)
+                act.setFont(_crisp_font("Microsoft YaHei UI", 9.5, bold=True))
             act.triggered.connect(lambda checked=False, v=opt_val: self._on_item_triggered(v))
 
     def _on_item_triggered(self, val: str) -> None:
@@ -780,6 +796,7 @@ class EmptyStateTableView(QTableView):
         if model is not None and model.rowCount() == 0:
             painter = QPainter(self.viewport())
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
             vr = self.viewport().rect()
             cx = vr.center().x()
             cy = vr.center().y()
@@ -919,7 +936,8 @@ class PasteImportDialog(QDialog):
 
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText("vless://...\ntrojan://...\n或粘贴完整 Clash proxies 配置...")
-        self.editor.setFont(QFont("Consolas", 9))
+        self.editor.setFont(_crisp_font("Consolas", 9.0))
+        self.editor.setStyleSheet('QPlainTextEdit { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 9pt; }')
         layout.addWidget(self.editor, 1)
 
         cb_text = QApplication.clipboard().text().strip()

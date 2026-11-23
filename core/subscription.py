@@ -1,12 +1,35 @@
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
-import requests
-import yaml
-
 from .parser import ProxyNode, parse_clash_proxy, parse_node_link, safe_b64decode
+
+if TYPE_CHECKING:
+    import requests
+    import yaml
+
+
+def _get_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
+
+
+def _get_yaml():
+    if "yaml" not in globals():
+        import yaml as _yaml
+        globals()["yaml"] = _yaml
+    return globals()["yaml"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "requests":
+        return _get_requests()
+    if name == "yaml":
+        return _get_yaml()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 DEFAULT_USER_AGENT = "ClashMetaForAndroid/2.10.1 v2rayN/6.45 Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 SUPPORTED_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://", "socks://", "socks5://")
@@ -27,7 +50,7 @@ def _decode_response_bytes(raw: bytearray, encoding: str | None) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def discard_redirect_body(response: requests.Response, **kwargs: Any) -> None:
+def discard_redirect_body(response: "requests.Response", **kwargs: Any) -> None:
     # Requests otherwise buffers each redirect body while resolving the next URL.
     if response.is_redirect:
         response.close()
@@ -105,10 +128,11 @@ def fetch_subscription_with_meta(
         "Accept": "*/*",
     }
 
+    req = _get_requests()
     # Try system environment first, fallback to direct connection if local system proxy is broken
     for trust_env in (True, False):
         try:
-            with requests.Session() as sess:
+            with req.Session() as sess:
                 sess.trust_env = trust_env
                 with sess.get(
                     clean_url, headers=headers, timeout=timeout, stream=True,
@@ -122,15 +146,15 @@ def fetch_subscription_with_meta(
                         raw.extend(chunk)
                     meta = parse_subscription_userinfo(resp.headers.get("Subscription-Userinfo", ""))
                     return _decode_response_bytes(raw, resp.encoding), meta
-        except requests.exceptions.HTTPError as exc:
+        except req.exceptions.HTTPError as exc:
             response = exc.response
             if (trust_env and response is not None and response.status_code == 407
-                    and requests.utils.select_proxy(response.url, requests.utils.get_environ_proxies(response.url))):
+                    and req.utils.select_proxy(response.url, req.utils.get_environ_proxies(response.url))):
                 continue
             raise
         except (
-            requests.exceptions.ConnectionError, requests.exceptions.Timeout,
-            requests.exceptions.InvalidSchema, requests.exceptions.InvalidURL,
+            req.exceptions.ConnectionError, req.exceptions.Timeout,
+            req.exceptions.InvalidSchema, req.exceptions.InvalidURL,
         ):
             if not trust_env:
                 raise
@@ -160,9 +184,10 @@ def parse_subscription_content(content: str) -> Tuple[List[ProxyNode], List[str]
 
     # 1. Try Clash / Mihomo YAML format
     if _CLASH_PROXIES.search(content) or content.startswith("{"):
+        yaml_mod = _get_yaml()
         try:
-            data = yaml.safe_load(content)
-        except yaml.YAMLError as exc:
+            data = yaml_mod.safe_load(content)
+        except yaml_mod.YAMLError as exc:
             mark = getattr(exc, "problem_mark", None)
             location = f"（第 {mark.line + 1} 行，第 {mark.column + 1} 列）" if mark else ""
             return nodes, [f"Clash YAML 语法错误{location}"]

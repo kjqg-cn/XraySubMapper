@@ -78,10 +78,12 @@ SVG_PATHS: Dict[str, str] = {
 }
 
 _ICON_CACHE: Dict[Tuple[str, str, int], QIcon] = {}
+_APP_LOGO_CACHE: Dict[bool, QIcon] = {}
 
 
 def clear_icon_caches() -> None:
     _ICON_CACHE.clear()
+    _APP_LOGO_CACHE.clear()
     _render_svg_pixmap.cache_clear()
 
 
@@ -157,7 +159,11 @@ def _render_logo_pixmap(px: int, active: bool = False) -> QPixmap:
 
 def build_app_logo_icon(active: bool = False) -> QIcon:
     """Build multi-resolution QIcon (16..256px) so Windows Taskbar, Alt-Tab, and Tray all render crisply."""
+    cached = _APP_LOGO_CACHE.get(active)
+    if cached is not None:
+        return cached
     ic = QIcon()
     for sz in (16, 20, 24, 32, 40, 48, 64, 128, 256):
         ic.addPixmap(_render_logo_pixmap(sz, active=active))
+    _APP_LOGO_CACHE[active] = ic
     return ic
