@@ -81,12 +81,23 @@ def _parse_proxy_port(value: Any, protocol: str) -> int:
 def _split_host_port(host_port: str, default_port: int = 443) -> Tuple[str, int]:
     """Safely split host:port including bracketed IPv6 like [2001:db8::1]:8388."""
     parsed = urlparse("//" + host_port.strip())
-    if not parsed.hostname or parsed.path not in ("", "/"):
+    if not parsed.hostname or any(c.isspace() for c in parsed.hostname) or parsed.path not in ("", "/"):
         raise ValueError("Invalid proxy host/port")
     port = _authority_port(parsed, default_port)
     if not 1 <= port <= 65535:
         raise ValueError("Proxy port must be in 1..65535")
     return parsed.hostname, port
+
+
+_SINGLE_LINE_RE = re.compile(r"[\r\n\t\x00-\x1f\x7f]+")
+
+
+def sanitize_single_line(text: Any) -> str:
+    """Collapse control characters and newlines into single spaces to prevent line injection."""
+    if text is None:
+        return ""
+    cleaned = _SINGLE_LINE_RE.sub(" ", str(text))
+    return re.sub(r" {2,}", " ", cleaned).strip()
 
 
 def _validate_transport(network: str) -> None:
@@ -105,6 +116,116 @@ def _validate_stream_security(security: str, allow_insecure: bool, public_key: s
         raise ValueError("Xray 26.11.9+ 不支持 allowInsecure / skip-cert-verify；请使用有效证书的节点")
 
 
+_HY2_SPEED_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(bps|kbps|mbps|gbps|tbps|b|k|m|g|t)?\s*$", re.IGNORECASE)
+_HY2_UNIT_CANONICAL = {
+    "b": "bps",
+    "k": "kbps",
+    "m": "mbps",
+    "g": "gbps",
+    "t": "tbps",
+    "bps": "bps",
+    "kbps": "kbps",
+    "mbps": "mbps",
+    "gbps": "gbps",
+    "tbps": "tbps",
+}
+_HY2_UNIT_BYTES = {
+    "bps": 1 / 8,
+    "kbps": 1_000 / 8,
+    "mbps": 1_000_000 / 8,
+    "gbps": 1_000_000_000 / 8,
+    "tbps": 1_000_000_000_000 / 8,
+}
+
+
+def _normalize_hysteria2_pin_sha256(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    if lower.startswith(("sha256:", "sha256/")):
+        lower = lower[7:]
+    cleaned = lower.replace(":", "").replace(" ", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", cleaned):
+        raise ValueError("Hysteria2 pinSHA256 证书指纹格式无效，须为 64 位十六进制 SHA-256")
+    return cleaned
+
+
+def _normalize_hysteria2_ports(value: str) -> Tuple[str, int]:
+    raw = str(value or "").strip().replace("/", ",")
+    if not raw:
+        return "", 0
+    normalized_parts = []
+    first_port = 0
+    for item in raw.split(","):
+        part = item.strip()
+        if not part:
+            raise ValueError(f"Hysteria2 端口跳跃范围无效: {value}")
+        if "-" in part:
+            bounds = [b.strip() for b in part.split("-")]
+            if len(bounds) != 2 or not bounds[0].isdigit() or not bounds[1].isdigit():
+                raise ValueError(f"Hysteria2 端口跳跃范围无效: {value}")
+            start, end = int(bounds[0]), int(bounds[1])
+            if not (1 <= start <= end <= 65535):
+                raise ValueError(f"Hysteria2 端口跳跃范围越界: {value}")
+            if first_port == 0:
+                first_port = start
+            normalized_parts.append(f"{start}-{end}")
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Hysteria2 端口跳跃范围无效: {value}")
+            port_num = int(part)
+            if not (1 <= port_num <= 65535):
+                raise ValueError(f"Hysteria2 端口跳跃范围越界: {value}")
+            if first_port == 0:
+                first_port = port_num
+            normalized_parts.append(str(port_num))
+    return ",".join(normalized_parts), first_port
+
+
+def _normalize_hysteria2_hop_interval(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        raise ValueError("Hysteria2 端口跳跃间隔须为 >= 5 的整数或范围")
+    raw = str(value).strip().lower()
+    if not raw or raw in ("0", "0s"):
+        return ""
+    if "-" in raw:
+        bounds = [part.strip().removesuffix("s") for part in raw.split("-")]
+        if len(bounds) != 2 or not bounds[0].isdigit() or not bounds[1].isdigit():
+            raise ValueError(f"Hysteria2 端口跳跃间隔格式无效: {value}")
+        lo, hi = int(bounds[0]), int(bounds[1])
+        if lo < 5 or lo > hi:
+            raise ValueError("Hysteria2 端口跳跃间隔须 >= 5 秒且下限不大于上限")
+        return f"{lo}-{hi}"
+    sec_str = raw.removesuffix("s")
+    if not sec_str.isdigit():
+        raise ValueError(f"Hysteria2 端口跳跃间隔格式无效: {value}")
+    sec = int(sec_str)
+    if sec < 5:
+        raise ValueError("Hysteria2 端口跳跃间隔须 >= 5 秒")
+    return str(sec)
+
+
+def _normalize_hysteria2_bandwidth(value: Any, field: str) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        raise ValueError(f"Hysteria2 {field} 带宽格式无效")
+    m = _HY2_SPEED_RE.match(str(value))
+    if not m:
+        raise ValueError(f"Hysteria2 {field} 带宽格式无效: {value}")
+    num = float(m.group(1))
+    unit = _HY2_UNIT_CANONICAL[(m.group(2) or "mbps").lower()]
+    if num == 0:
+        return ""
+    if num * _HY2_UNIT_BYTES[unit] < 65536:
+        raise ValueError(f"Hysteria2 {field} Brutal 带宽须至少 525 kbps (65536 B/s)")
+    num_text = str(int(num)) if num.is_integer() else f"{num:.6f}".rstrip("0").rstrip(".")
+    return f"{num_text} {unit}"
+
+
 def _apply_transport_settings(
     stream: Dict[str, Any],
     network: str,
@@ -113,9 +234,8 @@ def _apply_transport_settings(
     header_type: str = "none",
     mode: str = "",
 ) -> None:
-    """Populate Xray 26.x compatible streamSettings transport fields."""
+    """Populate Xray 26.x compatible streamSettings transport fields without raising on disabled placeholders."""
     net = (network or "tcp").lower()
-    _validate_transport(net)
     if net in ("splithttp", "xhttp"):
         stream["network"] = "xhttp"
         xhttp_settings: Dict[str, Any] = {"path": path or "/"}
@@ -145,7 +265,7 @@ def _apply_transport_settings(
         if mode == "multi":
             grpc_settings["multiMode"] = True
         stream["grpcSettings"] = grpc_settings
-    else:
+    elif net in ("tcp", "raw"):
         stream["network"] = "tcp"
         if header_type == "http":
             stream["tcpSettings"] = {
@@ -157,6 +277,8 @@ def _apply_transport_settings(
                     },
                 }
             }
+    else:
+        stream["network"] = net
 
 
 def _build_tls_settings(
@@ -176,12 +298,20 @@ def _build_tls_settings(
     return tls_settings
 
 
+_NON_KEY_ATTRS = frozenset({
+    "local_port", "port_pinned", "enabled", "latency_ms",
+    "last_error", "exit_ip", "probe_state", "name", "raw_link", "_cached_connection_key",
+})
+
+
 class ProxyNode:
     def __init__(self, name: str, protocol: str, server: str, port: int, raw_link: str = ""):
+        object.__setattr__(self, "_cached_connection_key", None)
         self.server = (server or "").strip("[] ")
         self.port = _safe_int(port, 443)
         self.protocol = protocol.lower()
-        self.name = (name or "").strip() or f"{self.protocol}-{self.server}:{self.port}"
+        clean_name = sanitize_single_line(name)
+        self.name = clean_name or f"{self.protocol}-{self.server}:{self.port}"
         self.raw_link = raw_link
         self.local_port: int = 0
         self.port_pinned: bool = False
@@ -190,16 +320,37 @@ class ProxyNode:
         self.latency_ms: Optional[int] = None
         self.last_error: str = ""
         self.exit_ip: str = ""
+        self.probe_state: str = ""
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if name not in _NON_KEY_ATTRS:
+            object.__setattr__(self, "_cached_connection_key", None)
 
     def is_placeholder_node(self) -> bool:
         return self.server.lower() in DUMMY_SERVERS or self.port <= 1 or self.port > 65535
 
-    def to_outbound(self, tag: str) -> Dict[str, Any]:
+    def validate_runtime(self) -> None:
+        if not self.server:
+            raise ValueError("节点缺少服务器地址 (server)")
+        if not (1 <= self.port <= 65535):
+            raise ValueError(f"节点端口无效 ({self.port})，须在 1~65535 之间")
+
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def to_outbound(self, tag: str) -> Dict[str, Any]:
+        if self.enabled:
+            self.validate_runtime()
+        return self._build_outbound(tag)
 
     def connection_key(self) -> str:
         """Stable identity excluding display name, port assignment and probe results."""
-        return json.dumps(self.to_outbound("node"), sort_keys=True, ensure_ascii=False)
+        cached = getattr(self, "_cached_connection_key", None)
+        if cached is None:
+            cached = json.dumps(self._build_outbound("node"), sort_keys=True, ensure_ascii=False)
+            object.__setattr__(self, "_cached_connection_key", cached)
+        return cached
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -239,8 +390,6 @@ class VMessNode(ProxyNode):
         raw_link: str = "",
     ):
         super().__init__(name, "vmess", server, port, raw_link)
-        if self.enabled and not str(uuid or "").strip():
-            raise ValueError("VMess 缺少 UUID")
         self.uuid = uuid
         self.alter_id = _safe_int(alter_id, 0)
         self.security = security or "auto"
@@ -254,6 +403,13 @@ class VMessNode(ProxyNode):
         self.fp = fp or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
+        if self.enabled:
+            self.validate_runtime()
+
+    def validate_runtime(self) -> None:
+        super().validate_runtime()
+        if not str(self.uuid or "").strip():
+            raise ValueError("VMess 缺少 UUID")
         _validate_transport(self.network)
         _validate_stream_security(self.tls or "none", self.allow_insecure)
 
@@ -278,7 +434,7 @@ class VMessNode(ProxyNode):
         )
         return d
 
-    def to_outbound(self, tag: str) -> Dict[str, Any]:
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
         stream: Dict[str, Any] = {}
         if self.tls == "tls":
             stream["security"] = "tls"
@@ -346,8 +502,6 @@ class VLESSNode(ProxyNode):
         raw_link: str = "",
     ):
         super().__init__(name, "vless", server, port, raw_link)
-        if self.enabled and not str(uuid or "").strip():
-            raise ValueError("VLESS 缺少 UUID")
         self.uuid = uuid
         self.flow = flow or ""
         self.encryption = encryption or "none"
@@ -364,6 +518,13 @@ class VLESSNode(ProxyNode):
         self.spx = spx or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
+        if self.enabled:
+            self.validate_runtime()
+
+    def validate_runtime(self) -> None:
+        super().validate_runtime()
+        if not str(self.uuid or "").strip():
+            raise ValueError("VLESS 缺少 UUID")
         _validate_transport(self.network)
         _validate_stream_security(self.security, self.allow_insecure, self.pbk)
 
@@ -391,7 +552,7 @@ class VLESSNode(ProxyNode):
         )
         return d
 
-    def to_outbound(self, tag: str) -> Dict[str, Any]:
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
         user_info: Dict[str, Any] = {
             "id": self.uuid,
             "encryption": self.encryption,
@@ -466,8 +627,6 @@ class TrojanNode(ProxyNode):
         raw_link: str = "",
     ):
         super().__init__(name, "trojan", server, port, raw_link)
-        if self.enabled and not password:
-            raise ValueError("Trojan 缺少密码")
         self.password = password
         self.network = (network or "tcp").lower()
         self.header_type = header_type or "none"
@@ -482,6 +641,13 @@ class TrojanNode(ProxyNode):
         self.spx = spx or ""
         self.allow_insecure = bool(allow_insecure)
         self.mode = mode or ""
+        if self.enabled:
+            self.validate_runtime()
+
+    def validate_runtime(self) -> None:
+        super().validate_runtime()
+        if not self.password:
+            raise ValueError("Trojan 缺少密码")
         _validate_transport(self.network)
         _validate_stream_security(self.security, self.allow_insecure, self.pbk)
 
@@ -507,7 +673,7 @@ class TrojanNode(ProxyNode):
         )
         return d
 
-    def to_outbound(self, tag: str) -> Dict[str, Any]:
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
         stream: Dict[str, Any] = {"security": self.security}
         server_name = self.sni or self.host or self.server
 
@@ -556,10 +722,15 @@ class ShadowsocksNode(ProxyNode):
     def __init__(self, name: str, server: str, port: int, method: str, password: str, raw_link: str = ""):
         super().__init__(name, "shadowsocks", server, port, raw_link)
         self.method = str(method or "").strip()
-        if self.enabled and not self.method:
-            raise ValueError("Shadowsocks 缺少加密方式 (method / cipher)")
         self.password = password
-        if self.enabled and not self.password:
+        if self.enabled:
+            self.validate_runtime()
+
+    def validate_runtime(self) -> None:
+        super().validate_runtime()
+        if not self.method:
+            raise ValueError("Shadowsocks 缺少加密方式 (method / cipher)")
+        if not self.password:
             raise ValueError("Shadowsocks 缺少密码")
 
     def to_dict(self) -> Dict[str, Any]:
@@ -567,7 +738,7 @@ class ShadowsocksNode(ProxyNode):
         d.update({"method": self.method, "password": self.password})
         return d
 
-    def to_outbound(self, tag: str) -> Dict[str, Any]:
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
         return {
             "tag": tag,
             "protocol": "shadowsocks",
@@ -595,7 +766,7 @@ class SocksNode(ProxyNode):
         d.update({"user": self.user, "password": self.password})
         return d
 
-    def to_outbound(self, tag: str) -> Dict[str, Any]:
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
         server_obj: Dict[str, Any] = {
             "address": self.server,
             "port": self.port,
@@ -606,6 +777,141 @@ class SocksNode(ProxyNode):
             "tag": tag,
             "protocol": "socks",
             "settings": {"servers": [server_obj]},
+        }
+
+
+class Hysteria2Node(ProxyNode):
+    def __init__(
+        self,
+        name: str,
+        server: str,
+        port: int,
+        password: str,
+        sni: str = "",
+        alpn: str = "",
+        fp: str = "",
+        pin_sha256: str = "",
+        allow_insecure: bool = False,
+        obfs: str = "",
+        obfs_password: str = "",
+        mport: str = "",
+        hop_interval: str = "",
+        up: Any = "",
+        down: Any = "",
+        raw_link: str = "",
+    ):
+        super().__init__(name, "hysteria2", server, port, raw_link)
+        self.password = password
+        self.sni = (sni or "").strip()
+        self.alpn = (alpn or "").strip()
+        self.fp = (fp or "").strip()
+        self.pin_sha256 = _normalize_hysteria2_pin_sha256(pin_sha256)
+        self.allow_insecure = bool(allow_insecure)
+        obfs_norm = (obfs or "").strip().lower()
+        if obfs_norm in ("", "none"):
+            self.obfs = ""
+            self.obfs_password = ""
+        elif obfs_norm == "salamander":
+            self.obfs = "salamander"
+            self.obfs_password = str(obfs_password or "")
+        else:
+            raise ValueError(f"不支持的 Hysteria2 混淆方式: {obfs}")
+        self.mport, _ = _normalize_hysteria2_ports(mport)
+        self.hop_interval = _normalize_hysteria2_hop_interval(hop_interval)
+        self.up = _normalize_hysteria2_bandwidth(up, "up")
+        self.down = _normalize_hysteria2_bandwidth(down, "down")
+        if self.enabled:
+            self.validate_runtime()
+
+    def validate_runtime(self) -> None:
+        super().validate_runtime()
+        if not self.password:
+            raise ValueError("Hysteria2 缺少密码 (auth / password)")
+        if self.allow_insecure and not self.pin_sha256:
+            raise ValueError(
+                "Xray 26.11.9+ 不支持 allowInsecure / skip-cert-verify；请使用有效证书或配置 pinSHA256"
+            )
+        if self.obfs == "salamander" and not self.obfs_password:
+            raise ValueError("Hysteria2 Salamander 混淆缺少 obfs-password")
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = super().to_dict()
+        d.update(
+            {
+                "password": self.password,
+                "sni": self.sni,
+                "alpn": self.alpn,
+                "fp": self.fp,
+                "pin_sha256": self.pin_sha256,
+                "allow_insecure": self.allow_insecure,
+                "obfs": self.obfs,
+                "obfs_password": self.obfs_password,
+                "mport": self.mport,
+                "hop_interval": self.hop_interval,
+                "up": self.up,
+                "down": self.down,
+            }
+        )
+        return d
+
+    def _build_outbound(self, tag: str) -> Dict[str, Any]:
+        tls_settings = _build_tls_settings(
+            server_name=self.sni or self.server,
+            fp=self.fp,
+            alpn=self.alpn,
+        )
+        if self.pin_sha256:
+            tls_settings["pinnedPeerCertSha256"] = self.pin_sha256
+
+        stream: Dict[str, Any] = {
+            "network": "hysteria",
+            "security": "tls",
+            "tlsSettings": tls_settings,
+            "hysteriaSettings": {
+                "version": 2,
+                "auth": self.password,
+            },
+        }
+
+        finalmask: Dict[str, Any] = {}
+        udp_masks: list[Dict[str, Any]] = []
+        if self.obfs == "salamander" and self.obfs_password:
+            udp_masks.append({"type": "salamander", "settings": {"password": self.obfs_password}})
+        if self.mport:
+            # Xray 26.11+ requires udphop as the final UDP mask element when combined with salamander.
+            udp_masks.append(
+                {
+                    "type": "udphop",
+                    "settings": {
+                        "mode": "intervalremote",
+                        "remotePorts": self.mport,
+                        "interval": self.hop_interval or "30",
+                    },
+                }
+            )
+        if udp_masks:
+            finalmask["udp"] = udp_masks
+
+        if self.up or self.down:
+            quic_params: Dict[str, Any] = {"congestion": "brutal"}
+            if self.up:
+                quic_params["brutalUp"] = self.up
+            if self.down:
+                quic_params["brutalDown"] = self.down
+            finalmask["quicParams"] = quic_params
+
+        if finalmask:
+            stream["finalmask"] = finalmask
+
+        return {
+            "tag": tag,
+            "protocol": "hysteria",
+            "settings": {
+                "version": 2,
+                "address": self.server,
+                "port": self.port,
+            },
+            "streamSettings": stream,
         }
 
 
@@ -703,6 +1009,25 @@ def node_from_dict(d: Dict[str, Any]) -> Optional[ProxyNode]:
             password=d.get("password", ""),
             raw_link=raw_link,
         )
+    elif proto in ("hysteria2", "hy2"):
+        node = Hysteria2Node(
+            name=name,
+            server=server,
+            port=port,
+            password=d.get("password", ""),
+            sni=d.get("sni", ""),
+            alpn=d.get("alpn", ""),
+            fp=d.get("fp", ""),
+            pin_sha256=d.get("pin_sha256", ""),
+            allow_insecure=bool(d.get("allow_insecure", False)),
+            obfs=d.get("obfs", ""),
+            obfs_password=d.get("obfs_password", ""),
+            mport=d.get("mport", ""),
+            hop_interval=d.get("hop_interval", ""),
+            up=d.get("up", ""),
+            down=d.get("down", ""),
+            raw_link=raw_link,
+        )
 
     if node:
         node.local_port = _safe_int(d.get("local_port"), 0)
@@ -725,8 +1050,8 @@ def parse_vmess(link: str) -> VMessNode:
 
     net = str(data.get("net") or "tcp").strip().lower()
     path = str(data.get("path") or "").strip()
-    mode = ""
-    if net == "grpc" and data.get("type") == "multi":
+    mode = str(data.get("mode") or "").strip()
+    if not mode and net == "grpc" and data.get("type") == "multi":
         mode = "multi"
 
     return VMessNode(
@@ -847,8 +1172,11 @@ def parse_ss(link: str) -> ShadowsocksNode:
         main_part = link
 
     body = main_part[5:].strip()
-    if "?" in body:
-        body, query = body.split("?", 1)
+    at_idx = body.rfind("@")
+    q_idx = body.find("?", at_idx + 1)
+    if q_idx != -1:
+        query = body[q_idx + 1 :]
+        body = body[:q_idx]
         if any(key.lower() == "plugin" for key, _ in parse_qsl(query, keep_blank_values=True)):
             raise ValueError("不支持 Shadowsocks 插件节点 (plugin)")
 
@@ -894,30 +1222,41 @@ def parse_socks(link: str) -> SocksNode:
     if "#" in rest:
         rest, frag = rest.split("#", 1)
         name = unquote(frag).strip()
-    if "?" in rest:
-        rest = rest.split("?", 1)[0]
+    at_idx = rest.rfind("@")
+    q_idx = rest.find("?", at_idx + 1)
+    if q_idx != -1:
+        query = rest[q_idx + 1 :]
+        rest = rest[:q_idx]
+        q_params = _parse_share_query(query)
+        sec = q_params.get("security", [""])[0].lower()
+        if any(_safe_bool(v) for v in q_params.get("tls", ())) or sec in ("tls", "reality"):
+            raise ValueError("暂不支持带 TLS 或 REALITY 的 SOCKS5 节点")
 
     user = ""
     password = ""
 
     if "@" in rest:
         raw_auth, host_port = rest.rsplit("@", 1)
-        unquoted_auth = unquote(raw_auth)
-        if ":" in unquoted_auth:
-            user, password = unquoted_auth.split(":", 1)
+        if ":" in raw_auth:
+            raw_user, raw_pass = raw_auth.split(":", 1)
+            user, password = unquote(raw_user), unquote(raw_pass)
         else:
             decoded_auth = safe_b64decode(raw_auth)
             if ":" in decoded_auth:
                 user, password = decoded_auth.split(":", 1)
             else:
-                user = unquoted_auth
+                unquoted_auth = unquote(raw_auth)
+                if ":" in unquoted_auth:
+                    user, password = unquoted_auth.split(":", 1)
+                else:
+                    user = unquoted_auth
         server, port = _split_host_port(host_port, 1080)
     else:
-        # Handle full Base64 socks://BASE64(user:pass@host:port) or plain host:port
+        # Handle full Base64 socks://BASE64(user:pass@host:port) or plain host[:port]
         if ":" in rest:
             server, port = _split_host_port(rest, 1080)
         else:
-            decoded = safe_b64decode(rest)
+            decoded = safe_b64decode(rest) if re.fullmatch(r"[A-Za-z0-9+/=_-]+", rest) else ""
             if "@" in decoded:
                 auth_part, hp_part = decoded.rsplit("@", 1)
                 if ":" in auth_part:
@@ -926,7 +1265,7 @@ def parse_socks(link: str) -> SocksNode:
             elif ":" in decoded:
                 server, port = _split_host_port(decoded, 1080)
             else:
-                raise ValueError("Invalid socks link")
+                server, port = _split_host_port(rest, 1080)
 
     return SocksNode(
         name=name or f"socks-{server}:{port}",
@@ -934,6 +1273,107 @@ def parse_socks(link: str) -> SocksNode:
         port=port,
         user=user,
         password=password,
+        raw_link=link,
+    )
+
+
+_HY2_SLASH_PORT_TAIL_RE = re.compile(r"^(\d+(?:\s*-\s*\d+)?(?:[,/]\d+(?:\s*-\s*\d+)?)*)(?=/|$)")
+
+
+def _extract_hysteria2_authority(rest: str) -> str:
+    at_idx = rest.rfind("@")
+    slash_idx = rest.find("/", at_idx + 1)
+    if slash_idx == -1:
+        return rest
+    head = rest[:slash_idx]
+    tail = rest[slash_idx + 1 :]
+    host_part = head[at_idx + 1 :] if at_idx != -1 else head
+    has_port_sep = ("]:" in host_part) if host_part.startswith("[") else (":" in host_part)
+    if has_port_sep and tail:
+        m = _HY2_SLASH_PORT_TAIL_RE.match(tail)
+        if m:
+            return f"{head}/{m.group(1)}"
+    return head
+
+
+def _split_hysteria2_host_port(host_port: str) -> Tuple[str, int, str]:
+    """Split Hysteria2 host[:port|port-range], supporting IPv6 brackets and multi-port ranges."""
+    hp = host_port.strip()
+    if not hp:
+        raise ValueError("Invalid Hysteria2 host/port")
+    if hp.startswith("["):
+        end_bracket = hp.find("]")
+        if end_bracket == -1:
+            raise ValueError("Invalid IPv6 host in Hysteria2 link")
+        server = hp[1:end_bracket].strip()
+        rest = hp[end_bracket + 1 :]
+        if rest and not rest.startswith(":"):
+            raise ValueError("Invalid Hysteria2 host/port")
+        port_part = rest[1:] if rest.startswith(":") else ""
+        if rest == ":":
+            raise ValueError("Missing proxy port")
+    else:
+        if ":" in hp:
+            if hp.count(":") > 1:
+                raise ValueError("IPv6 地址须使用 [...] 包裹")
+            server, port_part = hp.rsplit(":", 1)
+            if not port_part:
+                raise ValueError("Missing proxy port")
+        else:
+            server, port_part = hp, ""
+    server = server.strip()
+    if not server:
+        raise ValueError("Invalid Hysteria2 host/port")
+    if not port_part:
+        return server, 443, ""
+    if "-" in port_part or "," in port_part or "/" in port_part:
+        mport, first_port = _normalize_hysteria2_ports(port_part)
+        return server, first_port, mport
+    port = _parse_proxy_port(port_part, "Hysteria2")
+    return server, port, ""
+
+
+def parse_hysteria2(link: str) -> Hysteria2Node:
+    scheme_sep = link.find("://")
+    rest = link[scheme_sep + 3 :]
+    name = ""
+    if "#" in rest:
+        rest, frag = rest.split("#", 1)
+        name = unquote(frag).strip()
+    query = ""
+    at_idx = rest.rfind("@")
+    q_idx = rest.find("?", at_idx + 1)
+    if q_idx != -1:
+        query = rest[q_idx + 1 :]
+        rest = rest[:q_idx]
+    authority = _extract_hysteria2_authority(rest)
+    userinfo, separator, host_port = authority.rpartition("@")
+    password = unquote(userinfo) if separator else ""
+    server, port, authority_mport = _split_hysteria2_host_port(host_port)
+    params = _parse_share_query(query)
+
+    def get_p(key: str, default: str = "") -> str:
+        return params.get(key.lower(), [default])[0]
+
+    mport = get_p("mport") or get_p("ports") or authority_mport
+    hop_interval = get_p("hop-interval") or get_p("hop_interval") or get_p("interval")
+
+    return Hysteria2Node(
+        name=name or f"hy2-{server}:{port}",
+        server=server,
+        port=port,
+        password=password,
+        sni=get_p("sni") or get_p("peer"),
+        alpn=get_p("alpn"),
+        fp=get_p("fp"),
+        pin_sha256=get_p("pinsha256") or get_p("pin-sha256"),
+        allow_insecure=_query_allows_insecure(params),
+        obfs=get_p("obfs"),
+        obfs_password=get_p("obfs-password") or get_p("obfs_password"),
+        mport=mport,
+        hop_interval=hop_interval,
+        up=get_p("up") or get_p("upmbps"),
+        down=get_p("down") or get_p("downmbps"),
         raw_link=link,
     )
 
@@ -951,6 +1391,8 @@ def parse_node_link(link: str) -> ProxyNode:
         return parse_ss(link)
     if lower.startswith("socks://") or lower.startswith("socks5://"):
         return parse_socks(link)
+    if lower.startswith("hysteria2://") or lower.startswith("hy2://"):
+        return parse_hysteria2(link)
     raise ValueError(f"Unsupported protocol: {link[:12]}")
 
 
@@ -987,15 +1429,6 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
         host = str(xhttp_opts.get("host") or "")
         mode = str(xhttp_opts.get("mode") or "")
 
-    h2_opts = p.get("h2-opts")
-    if isinstance(h2_opts, dict):
-        path = str(h2_opts.get("path") or path)
-        h2_hosts = h2_opts.get("host")
-        if isinstance(h2_hosts, list) and h2_hosts:
-            host = str(h2_hosts[0])
-        elif isinstance(h2_hosts, str):
-            host = h2_hosts
-
     http_opts = p.get("http-opts")
     if network in ("tcp", "raw") and isinstance(http_opts, dict) and http_opts:
         header_type = "http"
@@ -1029,9 +1462,11 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Clash reality-opts 必须为映射")
     pbk = ""
     sid = ""
+    spx = ""
     if isinstance(reality_opts, dict):
         pbk = str(reality_opts.get("public-key") or "")
         sid = str(reality_opts.get("short-id") or "")
+        spx = str(reality_opts.get("spider-x") or "")
 
     return {
         "network": network,
@@ -1046,6 +1481,7 @@ def _extract_clash_transport(p: Dict[str, Any]) -> Dict[str, Any]:
         "has_reality": isinstance(reality_opts, dict) and bool(reality_opts),
         "pbk": pbk,
         "sid": sid,
+        "spx": spx,
     }
 
 
@@ -1068,6 +1504,43 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
     ptype = _clash_str(p.get("type")).lower()
     name = _clash_str(p.get("name")).strip()
     server = _clash_str(p.get("server")).strip()
+    if ptype in ("hysteria2", "hy2"):
+        if p.get("ca") or p.get("ca-str"):
+            raise ValueError("暂不支持 Clash Hysteria2 自定义 CA 证书 (ca / ca-str)")
+        raw_ports = _clash_str(p.get("ports")).strip() or _clash_str(p.get("mport")).strip()
+        mport, first_hop_port = _normalize_hysteria2_ports(raw_ports)
+        raw_port = p.get("port")
+        if first_hop_port and (
+            raw_port is None
+            or raw_port == ""
+            or (not isinstance(raw_port, bool) and raw_port in (0, "0"))
+        ):
+            port = first_hop_port
+        else:
+            port = _parse_proxy_port(443 if raw_port is None else raw_port, "Clash")
+        raw_pw = p.get("password") if p.get("password") is not None else p.get("auth")
+        raw_alpn = p.get("alpn")
+        if isinstance(raw_alpn, list):
+            alpn = ",".join(str(x) for x in raw_alpn if x)
+        else:
+            alpn = _clash_str(raw_alpn)
+        return Hysteria2Node(
+            name=name,
+            server=server,
+            port=port,
+            password=_clash_str(raw_pw),
+            sni=_clash_str(p.get("sni") or p.get("servername")).strip(),
+            alpn=alpn,
+            fp=_clash_str(p.get("client-fingerprint")).strip(),
+            pin_sha256=_clash_str(p.get("fingerprint") or p.get("pinSHA256") or p.get("pin-sha256")).strip(),
+            allow_insecure=_safe_bool(p.get("skip-cert-verify", False)),
+            obfs=_clash_str(p.get("obfs")).strip(),
+            obfs_password=_clash_str(p.get("obfs-password")),
+            mport=mport,
+            hop_interval=p.get("hop-interval"),
+            up=p.get("up"),
+            down=p.get("down"),
+        )
     port = _parse_proxy_port(p.get("port", 443), "Clash")
     password = _clash_str(p.get("password"))
     if ptype in ("vmess", "vless", "trojan"):
@@ -1102,6 +1575,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             port=port,
             uuid=str(p.get("uuid") or ""),
             flow=str(p.get("flow") or ""),
+            encryption=str(p.get("encryption") or "none"),
             network=tr["network"],
             header_type=tr["header_type"],
             host=tr["host"],
@@ -1112,6 +1586,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             fp=tr["fp"],
             pbk=tr["pbk"],
             sid=tr["sid"],
+            spx=tr["spx"],
             allow_insecure=tr["allow_insecure"],
             mode=tr["mode"],
         )
@@ -1132,6 +1607,7 @@ def parse_clash_proxy(p: Dict[str, Any]) -> ProxyNode:
             path=tr["path"],
             pbk=tr["pbk"],
             sid=tr["sid"],
+            spx=tr["spx"],
             allow_insecure=tr["allow_insecure"],
             mode=tr["mode"],
         )

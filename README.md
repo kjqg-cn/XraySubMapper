@@ -18,7 +18,7 @@
   - 节点 2 ➔ `127.0.0.1:10801`
   - 节点 N ➔ `127.0.0.1:10800 + N`
 - **多协议与新传输层兼容**：
-  - 原生支持 `VLESS`（含 `REALITY` / `XTLS-Vision` / `XHTTP` / `HTTPUpgrade`）、`Trojan`、`VMess`、`Shadowsocks`（含 `SS2022` 与 IPv6）、`Socks5`。
+  - 原生支持 `VLESS`（含 `REALITY` / `XTLS-Vision` / `XHTTP` / `HTTPUpgrade`）、`Hysteria2`（含 `Salamander` 混淆、`UDP` 端口跳跃、`Brutal` 带宽限速与 `pinSHA256` 证书固定）、`Trojan`、`VMess`、`Shadowsocks`（含 `SS2022` 与 IPv6）、`Socks5`。
   - 自动识别标准 Base64 订阅、Clash / Mihomo YAML 配置及纯文本多行分享链接，自动提取 `Subscription-Userinfo` 流量与到期信息并过滤无效提示节点。
 - **灵活的端口编排与锁定保护**：
   - 双击单元格可直接内联编辑单节点端口并自动打上 **端口锁定 (`PIN`)** 标识，顺延重排或增删节点时自动跳过已锁定端口；实时标红预警重复端口冲突。
@@ -36,8 +36,8 @@
 
 ### 兼容范围与导入提示
 
-- 内核要求为官方 **Xray 26.11.9 或更高版本**，启动时自动检查版本。已验证的传输为 TCP/RAW、WebSocket、gRPC、XHTTP 和 HTTPUpgrade。
-- 加密节点的 `allowInsecure` / `skip-cert-verify: true`、Clash TLS 证书指纹锁定、Clash SOCKS5 TLS、旧 H2/HTTP/QUIC 传输及 Shadowsocks 插件节点会报告导入错误。请向节点提供方获取受支持的配置。
+- 内核要求为官方 **Xray 26.11.9 或更高版本**，启动时自动检查版本。已验证的传输为 TCP/RAW、WebSocket、gRPC、XHTTP、HTTPUpgrade 与 Hysteria2。
+- 加密节点的 `allowInsecure` / `skip-cert-verify: true`（未配置 `pinSHA256` 证书固定时）、Clash 非 Hysteria2 节点的 TLS 证书指纹锁定、Clash Hysteria2 自定义 `ca`/`ca-str`、Clash SOCKS5 TLS、旧 H2/HTTP/QUIC 传输及 Shadowsocks 插件节点会报告导入错误。请向节点提供方获取受支持的配置。
 - Clash XHTTP 支持 `xhttp-opts.path`、`host`、`mode`；其他 XHTTP 选项会明确报告尚不支持。
 - 更新同一订阅时按连接配置匹配节点，保留端口锁定和启停选择；手动替换导入会重新编排端口。
 - 服务运行时，节点、端口、监听地址或鉴权有待应用变更，会拦截代理复制和导出，避免导出与实际出口不符的地址。服务停止时可导出计划映射。
@@ -155,9 +155,9 @@ XraySubMapper/
 
 ## 致谢与免责声明
 
-- **致谢**：本项目底层代理转发能力基于 [XTLS/Xray-core](https://github.com/XTLS/Xray-core)（`MPL-2.0`），桌面图形界面基于 [Qt for Python / PySide6](https://wiki.qt.io/Qt_for_Python)（`LGPLv3`）。
+- **致谢**：本项目底层代理转发能力基于 [XTLS/Xray-core](https://github.com/XTLS/Xray-core)（`MPL-2.0`），桌面图形界面基于 [Qt for Python / PySide6](https://wiki.qt.io/Qt_for_Python)（`LGPLv3`），完整第三方开源组件与便携包合规声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 - **免责声明**：本工具仅限用于合法授权下的软件研发调试、多地域网络连通性测试与协议技术研究。使用者须严格遵守所在地法律法规，严禁将本工具用于任何违法违规用途，一切因不当使用产生的后果由使用者自行承担。
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE). Third-party notices are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

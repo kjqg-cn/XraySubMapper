@@ -178,3 +178,21 @@ def test_interrupted_replace_leaves_previous_cache(cache_paths, make_node, monke
     assert len(set(attempted)) == 2
     assert not list(path.parent.glob("*.tmp"))
     assert path.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI")
+def test_atomic_write_supports_bare_relative_filename_and_preserves_original_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config._atomic_write_json("bare_settings.json", {"ok": True})
+    assert (tmp_path / "bare_settings.json").is_file()
+
+    def fail_replace(src, dst):
+        raise OSError("replace failed")
+
+    def fail_unlink(path):
+        raise PermissionError("locked by antivirus")
+
+    monkeypatch.setattr(config.os, "replace", fail_replace)
+    monkeypatch.setattr(config.os, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="replace failed"):
+        config._atomic_write_json("bare_settings.json", {"ok": False})

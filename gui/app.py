@@ -1,4 +1,5 @@
 import copy
+import inspect
 import os
 import sys
 import threading
@@ -13,14 +14,14 @@ if sys.platform == "win32":
 else:
     _WIN32_MSG = None
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRegularExpression, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
     QFont,
-    QIntValidator,
     QKeySequence,
+    QRegularExpressionValidator,
     QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -48,17 +49,24 @@ from PySide6.QtWidgets import (
 from core.config import (
     CacheSaveResult,
     clear_cached_nodes,
+    enable_windows_dpi_awareness,
     load_cached_nodes,
     load_settings,
     nodes_cache_protected,
     save_cached_nodes,
     save_settings,
 )
-from core.parser import ProxyNode
+from core.parser import ProxyNode, sanitize_single_line
 from core.subscription import fetch_subscription_with_meta, parse_subscription_content
 from core.xray_manager import XrayManager, format_proxy_host
 from .icons import build_app_logo_icon, clear_icon_caches, icon
-from .single_instance import GUI_MUTEX_NAME, GuiInstanceLock, activate_existing_window, activation_message_id
+from .single_instance import (
+    GUI_MUTEX_NAME,
+    GuiInstanceLock,
+    activate_existing_window,
+    activation_message_id,
+    allow_activation_message,
+)
 from .widgets import (
     COL_ENABLED,
     COL_INDEX,
@@ -230,6 +238,16 @@ QPushButton[role="danger"]:hover {
     background-color: #FEE2E2;
     border-color: #FCA5A5;
 }
+QPushButton[role="danger_compact"] {
+    background-color: #FEF2F2;
+    border: 1px solid #FECACA;
+    color: #DC2626;
+    font-weight: bold;
+}
+QPushButton[role="danger_compact"]:hover {
+    background-color: #FEE2E2;
+    border-color: #FCA5A5;
+}
 
 /* Reload Dirty State Pill Button */
 QPushButton[role="warning_pill"] {
@@ -377,6 +395,7 @@ class UiBridge(QObject):
     logReceived = Signal(str)
     fetchFinished = Signal(object, str, object, str)
     serviceTransitioned = Signal(bool, str, str)
+    speedStarted = Signal(object)
     speedProgress = Signal(int, int, object)
     speedFinished = Signal(object, str)
     exitIpProgress = Signal(int, int, object)
@@ -390,6 +409,7 @@ class ProbeTask:
     nodes: Tuple[ProxyNode, ...]
     single: bool
     cancelled: threading.Event = field(default_factory=threading.Event)
+    node_rows: Dict[int, int] = field(default_factory=dict)
 
 
 class MainWindow(QMainWindow):
@@ -406,6 +426,7 @@ class MainWindow(QMainWindow):
             self.nodes: List[ProxyNode] = load_cached_nodes()
         self.xray_mgr = XrayManager()
         self._fetch_request: Optional[object] = None
+        self._fetch_cancel: Optional[threading.Event] = None
         self._speed_task: Optional[ProbeTask] = None
         self._exit_ip_task: Optional[ProbeTask] = None
         self._closing = False
@@ -417,11 +438,13 @@ class MainWindow(QMainWindow):
         self._service_busy = False
         self._manual_name_width: Optional[int] = None
         self._resizing_columns_internally = False
+        self._activation_filter_hwnd: int = 0
 
         self.bridge = UiBridge(self)
         self.bridge.logReceived.connect(self._append_log)
         self.bridge.fetchFinished.connect(self._on_fetch_finished)
         self.bridge.serviceTransitioned.connect(self._on_service_transitioned)
+        self.bridge.speedStarted.connect(self._on_speed_started)
         self.bridge.speedProgress.connect(self._on_speed_progress)
         self.bridge.speedFinished.connect(self._on_speed_finished)
         self.bridge.exitIpProgress.connect(self._on_exit_ip_progress)
@@ -563,11 +586,11 @@ class MainWindow(QMainWindow):
         self._act_url_history.triggered.connect(self._show_recent_urls_menu)
         row_sub.addWidget(self.inp_url, 1)
 
-        self.btn_fetch = QPushButton(" 下载更新")
+        self.btn_fetch = QPushButton(" 拉取订阅")
         self.btn_fetch.setIcon(icon("download", "#FFFFFF", 15))
         self.btn_fetch.setProperty("role", "accent")
         self.btn_fetch.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_fetch.clicked.connect(self._fetch_subscription_async)
+        self.btn_fetch.clicked.connect(self._on_fetch_button_clicked)
         row_sub.addWidget(self.btn_fetch)
 
         btn_paste = QPushButton(" 粘贴导入")
@@ -618,7 +641,7 @@ class MainWindow(QMainWindow):
         row_ctrl.addWidget(lbl_port)
 
         self.inp_start_port = QLineEdit(str(int(self.settings.get("start_port", 10800))))
-        self.inp_start_port.setValidator(QIntValidator(1024, 65000, self))
+        self.inp_start_port.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,5}"), self))
         self.inp_start_port.setAlignment(Qt.AlignmentFlag.AlignCenter)
         port_font = QFont("Cascadia Mono", 9, QFont.Weight.Bold)
         port_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
@@ -716,6 +739,7 @@ class MainWindow(QMainWindow):
                 ("Trojan", "trojan", "sliders", "#7E22CE"),
                 ("VMess", "vmess", "sliders", "#B45309"),
                 ("Shadowsocks", "ss", "sliders", "#0E7490"),
+                ("Hysteria2", "hysteria2", "sliders", "#BE123C"),
                 ("Socks5", "socks", "sliders", "#475569"),
             ],
             initial_value="all",
@@ -903,16 +927,27 @@ class MainWindow(QMainWindow):
 
     def _restore_window_bounds(self) -> None:
         self.setMinimumSize(880, 560)
-        screen = QApplication.primaryScreen()
-        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        primary = QApplication.primaryScreen()
+        primary_avail = primary.availableGeometry() if primary else QRect(0, 0, 1920, 1080)
 
-        default_w = min(1120, int(avail.width() * 0.85))
-        default_h = min(720, int(avail.height() * 0.85))
+        default_w = min(1120, int(primary_avail.width() * 0.85))
+        default_h = min(720, int(primary_avail.height() * 0.85))
 
         rect_cfg = self.settings.get("window_rect")
         if isinstance(rect_cfg, list) and len(rect_cfg) == 4:
             try:
                 x, y, w, h = [int(v) for v in rect_cfg]
+                saved_rect = QRect(x, y, max(880, w), max(560, h))
+                target_avail = None
+                best_area = 0
+                for scr in QApplication.screens():
+                    geom = scr.availableGeometry()
+                    inter = saved_rect.intersected(geom)
+                    area = inter.width() * inter.height() if not inter.isEmpty() else 0
+                    if area > best_area:
+                        best_area = area
+                        target_avail = geom
+                avail = target_avail if target_avail is not None else primary_avail
                 w = max(880, min(w, avail.width()))
                 h = max(560, min(h, avail.height()))
                 x = max(avail.left(), min(x, avail.right() - w))
@@ -922,8 +957,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        cx = avail.left() + (avail.width() - default_w) // 2
-        cy = avail.top() + (avail.height() - default_h) // 2
+        cx = primary_avail.left() + (primary_avail.width() - default_w) // 2
+        cy = primary_avail.top() + (primary_avail.height() - default_h) // 2
         self.setGeometry(cx, cy, default_w, default_h)
 
     def _setup_shortcuts(self) -> None:
@@ -990,13 +1025,25 @@ class MainWindow(QMainWindow):
             fw.clearFocus()
         super().mousePressEvent(event)
 
+    def _ensure_activation_filter(self) -> None:
+        try:
+            hwnd = int(self.winId())
+        except Exception:
+            return
+        if hwnd and hwnd != self._activation_filter_hwnd:
+            self._activation_filter_hwnd = hwnd
+            allow_activation_message(hwnd)
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._ensure_activation_filter()
         QTimer.singleShot(0, self._sync_table_columns_to_viewport)
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
-        if event.type() == QEvent.Type.WindowStateChange:
+        if event.type() == QEvent.Type.WinIdChange:
+            self._ensure_activation_filter()
+        elif event.type() == QEvent.Type.WindowStateChange:
             # Ensure viewport width is settled after maximize <-> restore transition
             QTimer.singleShot(0, self._sync_table_columns_to_viewport)
             QTimer.singleShot(60, self._sync_table_columns_to_viewport)
@@ -1226,6 +1273,25 @@ class MainWindow(QMainWindow):
         self._report_cache_save(save_settings(self.settings, replace_unreadable=True))
         self._notify("已清空历史订阅记录", "info")
 
+    def _apply_fetch_button_state(self, fetching: bool) -> None:
+        if fetching:
+            self.btn_fetch.setText(" 取消拉取")
+            self.btn_fetch.setIcon(icon("stop", "#DC2626", 13))
+            self.btn_fetch.setProperty("role", "danger_compact")
+        else:
+            self.btn_fetch.setText(" 拉取订阅")
+            self.btn_fetch.setIcon(icon("download", "#FFFFFF", 15))
+            self.btn_fetch.setProperty("role", "accent")
+        self.btn_fetch.setEnabled(True)
+        self.btn_fetch.style().unpolish(self.btn_fetch)
+        self.btn_fetch.style().polish(self.btn_fetch)
+
+    def _on_fetch_button_clicked(self) -> None:
+        if self._fetch_request is not None:
+            self._cancel_fetch(notify=True)
+        else:
+            self._fetch_subscription_async()
+
     def _fetch_subscription_async(self) -> None:
         if self._closing or self._fetch_request is not None:
             return
@@ -1236,34 +1302,63 @@ class MainWindow(QMainWindow):
             return
 
         request = object()
+        cancel_event = threading.Event()
         self._fetch_request = request
+        self._fetch_cancel = cancel_event
         if QApplication.focusWidget() is self.btn_fetch:
             self.setFocus(Qt.FocusReason.OtherFocusReason)
-        self.btn_fetch.setEnabled(False)
-        self.btn_fetch.setText(" 正在拉取...")
+        self._apply_fetch_button_state(True)
+
+        fetch_fn = fetch_subscription_with_meta
+        try:
+            params = inspect.signature(fetch_fn).parameters
+            supports_cancel = "cancel_event" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            supports_cancel = False
 
         def _worker() -> None:
             try:
-                content, meta = fetch_subscription_with_meta(url)
+                if supports_cancel:
+                    content, meta = fetch_fn(url, cancel_event=cancel_event)
+                else:
+                    content, meta = fetch_fn(url)
+                if cancel_event.is_set():
+                    self._emit_worker_signal(self.bridge.fetchFinished, request, url, None, "")
+                    return
                 nodes, errors = parse_subscription_content(content)
+            except InterruptedError:
+                self._emit_worker_signal(self.bridge.fetchFinished, request, url, None, "")
             except Exception as exc:
-                self._emit_worker_signal(self.bridge.fetchFinished, request, url, None, str(exc))
+                self._emit_worker_signal(
+                    self.bridge.fetchFinished, request, url, None, "" if cancel_event.is_set() else str(exc),
+                )
             else:
                 self._emit_worker_signal(self.bridge.fetchFinished, request, url, (nodes, errors, meta), "")
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _cancel_fetch(self, *, notify: bool = False) -> None:
+        was_fetching = self._fetch_request is not None
+        if self._fetch_cancel is not None:
+            self._fetch_cancel.set()
+        self._reset_fetch()
+        if notify and was_fetching:
+            self._notify("已取消拉取订阅", "info")
+
     def _reset_fetch(self) -> None:
         self._fetch_request = None
-        self.btn_fetch.setEnabled(True)
-        self.btn_fetch.setText(" 下载更新")
+        self._fetch_cancel = None
+        self._apply_fetch_button_state(False)
 
     def _on_fetch_finished(self, request: object, url: str, result, error: str) -> None:
         if self._closing or request is not self._fetch_request:
             return
         self._reset_fetch()
         if result is None:
-            QMessageBox.critical(self, "下载订阅失败", f"请求订阅链接时出错：\n{error}")
+            if error:
+                QMessageBox.critical(self, "拉取订阅失败", f"请求订阅链接时出错：\n{error}")
             return
         nodes, errors, meta = result
         if not nodes:
@@ -1278,11 +1373,11 @@ class MainWindow(QMainWindow):
         self.settings["subscription_url"] = url
         self.settings["sub_userinfo"] = meta
         self._refresh_sub_userinfo_badge()
-        self._load_new_nodes(nodes, source_label=f"成功更新订阅 · 导入 {len(nodes)} 个节点", preserve_state=preserve_state)
+        self._load_new_nodes(nodes, source_label=f"成功拉取订阅 · 导入 {len(nodes)} 个节点", preserve_state=preserve_state)
         self._show_import_errors(errors)
 
     def _clear_subscription_source(self) -> None:
-        self._reset_fetch()
+        self._cancel_fetch()
         self.settings["subscription_url"] = ""
         self.settings["sub_userinfo"] = {}
         self.inp_url.clear()
@@ -1487,11 +1582,21 @@ class MainWindow(QMainWindow):
         self._assign_ports(reset_pinned=False)
         self._notify(f"已自动筛除失效节点，保留 {kept} 个可用节点", "success")
 
+    def _find_node_row(self, node: ProxyNode, hint_map: Optional[Dict[int, int]] = None) -> int:
+        if hint_map is not None:
+            row = hint_map.get(id(node))
+            if row is not None and 0 <= row < len(self.nodes) and self.nodes[row] is node:
+                return row
+        for idx, current in enumerate(self.nodes):
+            if current is node:
+                return idx
+        return -1
+
     def _clear_all_nodes(self) -> None:
         if not self.nodes and not nodes_cache_protected():
             return
-        if self.xray_mgr.is_running():
-            self._notify("代理服务正在运行中，请先停止服务再清空列表", "warning")
+        if self._service_busy or self.xray_mgr.is_running():
+            self._notify("代理服务正在启动、重载或运行中，请先停止服务再清空列表", "warning")
             return
         ans = QMessageBox.question(
             self,
@@ -1500,6 +1605,9 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans == QMessageBox.StandardButton.Yes:
+            if self._closing or self._service_busy or self.xray_mgr.is_running():
+                self._notify("服务状态已变化，已取消清空列表", "warning")
+                return
             result = clear_cached_nodes(replace_unreadable=True)
             self._report_cache_save(result)
             if result.error:
@@ -1536,23 +1644,31 @@ class MainWindow(QMainWindow):
             menu.addAction("复制原始节点分享链接", lambda: self._copy_text_toast(node.raw_link, "已复制原始分享链接"))
 
         menu.addSeparator()
-        menu.addAction("单独测速此节点", lambda: self._test_single_row_async(src_row)).setEnabled(
+        menu.addAction("单独测速此节点", lambda: self._test_single_node_async(node)).setEnabled(
             self._speed_task is None,
         )
-        menu.addAction("检测此节点出口 IP", lambda: self._probe_single_exit_ip_async(src_row)).setEnabled(
+        menu.addAction("检测此节点出口 IP", lambda: self._probe_single_exit_ip_node_async(node)).setEnabled(
             self._exit_ip_task is None,
         )
-        menu.addAction("修改本地端口...", lambda: self._prompt_edit_port(src_row))
+        menu.addAction("修改本地端口...", lambda: self._prompt_edit_port(node))
         if node.port_pinned:
-            menu.addAction("解除端口锁定", lambda: self._unpin_row_port(src_row))
+            menu.addAction("解除端口锁定", lambda: self._unpin_node_port(node))
 
         menu.addSeparator()
         menu.addAction("切换 启用 / 禁用 (Space)", self._toggle_selected_rows)
         menu.addAction("移除选中节点 (Delete)", self._delete_selected_rows)
         menu.exec(self.table_view.viewport().mapToGlobal(pos))
 
-    def _prompt_edit_port(self, src_row: int) -> None:
-        node = self.nodes[src_row]
+    def _prompt_edit_port(self, target: Any) -> None:
+        if isinstance(target, ProxyNode):
+            node = target
+            if self._find_node_row(node) < 0:
+                return
+        else:
+            src_row = int(target)
+            if not (0 <= src_row < len(self.nodes)):
+                return
+            node = self.nodes[src_row]
         val, ok = QInputDialog.getInt(
             self,
             "修改本地混合代理端口",
@@ -1562,12 +1678,22 @@ class MainWindow(QMainWindow):
             65535,
         )
         if ok:
-            self._on_inline_port_edited(src_row, val)
+            current_row = self._find_node_row(node)
+            if current_row >= 0:
+                self._on_inline_port_edited(current_row, val)
 
-    def _unpin_row_port(self, src_row: int) -> None:
-        self.nodes[src_row].port_pinned = False
+    def _unpin_node_port(self, node: ProxyNode) -> None:
+        row = self._find_node_row(node)
+        if row < 0:
+            return
+        self.nodes[row].port_pinned = False
         self._assign_ports(reset_pinned=False)
         self._notify("已解除端口锁定并重新顺延分配", "info")
+
+    def _unpin_row_port(self, src_row: int) -> None:
+        if not (0 <= src_row < len(self.nodes)):
+            return
+        self._unpin_node_port(self.nodes[src_row])
 
     # ------------------------------------------------------------------
     # Copy & Export Helpers
@@ -1579,7 +1705,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _copy_node_proxy(self, node: ProxyNode, fmt: str) -> None:
-        if self._ensure_ready_for_export() and node in self.nodes and node.enabled and node.local_port > 0:
+        if self._ensure_ready_for_export() and self._find_node_row(node) >= 0 and node.enabled and node.local_port > 0:
             self._copy_text_toast(self._format_node_proxy_line(node, fmt), "已复制代理地址")
 
     def _format_node_proxy_line(self, node: ProxyNode, fmt: str = "url") -> str:
@@ -1597,8 +1723,10 @@ class MainWindow(QMainWindow):
         base_url = f"http://{auth_prefix}{host_disp}:{node.local_port}"
         if fmt == "comment":
             lat_part = f" [{node.latency_ms}ms]" if (node.latency_ms is not None and node.latency_ms >= 0) else ""
-            ip_part = f" [{node.exit_ip}]" if node.exit_ip else ""
-            return f"{base_url}  # {node.name}{lat_part}{ip_part}"
+            safe_ip = sanitize_single_line(node.exit_ip)
+            ip_part = f" [{safe_ip}]" if safe_ip else ""
+            safe_name = sanitize_single_line(node.name)
+            return f"{base_url}  # {safe_name}{lat_part}{ip_part}"
         return base_url
 
     def _copy_text_toast(self, text: str, msg: str) -> None:
@@ -1771,7 +1899,8 @@ class MainWindow(QMainWindow):
                     self._applied_signature = None
                     self._set_service_badge_style("error", "● 启动失败")
                 self._sync_dirty_banner()
-                QMessageBox.critical(self, "Xray 服务启动失败", msg)
+                title = "Xray 配置重载失败" if action == "reload" else "Xray 服务启动失败"
+                QMessageBox.critical(self, title, msg)
         elif action == "stop":
             if ok:
                 self._applied_signature = None
@@ -1850,11 +1979,21 @@ class MainWindow(QMainWindow):
     def _test_single_row_async(self, src_row: int) -> None:
         self._start_probe(speed=True, src_row=src_row)
 
+    def _test_single_node_async(self, node: ProxyNode) -> None:
+        row = self._find_node_row(node)
+        if row >= 0:
+            self._start_probe(speed=True, src_row=row)
+
     def _test_all_speed_async(self) -> None:
         self._start_probe(speed=True)
 
     def _probe_single_exit_ip_async(self, src_row: int) -> None:
         self._start_probe(speed=False, src_row=src_row)
+
+    def _probe_single_exit_ip_node_async(self, node: ProxyNode) -> None:
+        row = self._find_node_row(node)
+        if row >= 0:
+            self._start_probe(speed=False, src_row=row)
 
     def _probe_all_exit_ips_async(self) -> None:
         self._start_probe(speed=False)
@@ -1870,17 +2009,41 @@ class MainWindow(QMainWindow):
         if not nodes:
             self._notify("没有已启用且已分配端口的节点可测试", "warning")
             return
-        task = ProbeTask(self.xray_mgr.generation, self._calc_config_signature(), nodes, src_row is not None)
+        node_rows = {id(n): i for i, n in enumerate(self.nodes)}
+        task = ProbeTask(
+            self.xray_mgr.generation,
+            self._calc_config_signature(),
+            nodes,
+            src_row is not None,
+            node_rows=node_rows,
+        )
         snapshots = copy.deepcopy(nodes)
         originals = {id(snapshot): node for node, snapshot in zip(nodes, snapshots)}
 
-        options = {}
+        options: Dict[str, Any] = {}
         if speed:
             self._speed_task = task
             button, label = self.btn_speed, "测速"
             operation = self.xray_mgr.test_all_proxies
             progress, finished = self.bridge.speedProgress, self.bridge.speedFinished
             options["test_url"] = str(self.settings.get("test_url") or "https://cp.cloudflare.com/generate_204")
+            try:
+                op_params = inspect.signature(operation).parameters
+                supports_start_cb = "start_cb" in op_params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in op_params.values()
+                )
+            except (TypeError, ValueError):
+                supports_start_cb = False
+            if supports_start_cb:
+                options["start_cb"] = lambda snapshot: self._emit_worker_signal(
+                    self.bridge.speedStarted, (task, originals[id(snapshot)]),
+                )
+            initial_state = "testing" if (len(nodes) <= 16 or not supports_start_cb) else "queued"
+            for node in nodes:
+                node.probe_state = initial_state
+                row = self._find_node_row(node, node_rows)
+                if row >= 0:
+                    self.table_model.refresh_row(row, recalc_conflicts=False)
         else:
             self._exit_ip_task = task
             button, label = self.btn_probe_ip, "探测"
@@ -1913,6 +2076,12 @@ class MainWindow(QMainWindow):
         task.cancelled.set()
         if speed:
             self._speed_task = None
+            for node in task.nodes:
+                if node.probe_state:
+                    node.probe_state = ""
+                    row = self._find_node_row(node, task.node_rows)
+                    if row >= 0:
+                        self.table_model.refresh_row(row, recalc_conflicts=False)
             self.btn_speed.setEnabled(True)
             self.btn_speed.setText(" 并发测速")
         else:
@@ -1930,19 +2099,36 @@ class MainWindow(QMainWindow):
                 and self.xray_mgr.is_running() and task.generation == self.xray_mgr.generation
                 and task.signature == self._applied_signature and task.signature == self._calc_config_signature())
 
+    def _on_speed_started(self, payload) -> None:
+        task, node = payload
+        if not self._probe_is_current(task, speed=True):
+            return
+        if node.probe_state != "testing":
+            row = self._find_node_row(node, task.node_rows)
+            if row >= 0:
+                node.probe_state = "testing"
+                self.table_model.refresh_row(row, recalc_conflicts=False)
+
     def _on_speed_progress(self, done: int, total: int, payload) -> None:
         task, node, snapshot = payload
-        if self._probe_is_current(task, speed=True) and node in self.nodes:
+        if not self._probe_is_current(task, speed=True):
+            return
+        row = self._find_node_row(node, task.node_rows)
+        if row >= 0:
             self.btn_speed.setText(f" 测速 {done}/{total}")
+            node.probe_state = ""
             node.latency_ms, node.last_error = snapshot.latency_ms, snapshot.last_error
-            self.table_model.refresh_row(self.nodes.index(node))
+            self.table_model.refresh_row(row, recalc_conflicts=False)
 
     def _on_exit_ip_progress(self, done: int, total: int, payload) -> None:
         task, node, snapshot = payload
-        if self._probe_is_current(task, speed=False) and node in self.nodes:
+        if not self._probe_is_current(task, speed=False):
+            return
+        row = self._find_node_row(node, task.node_rows)
+        if row >= 0:
             self.btn_probe_ip.setText(f" 探测 {done}/{total}")
             node.exit_ip = snapshot.exit_ip
-            self.table_model.refresh_row(self.nodes.index(node))
+            self.table_model.refresh_row(row, recalc_conflicts=False)
 
     def _finish_probe(self, task: ProbeTask, error: str, *, speed: bool) -> bool:
         if task is not (self._speed_task if speed else self._exit_ip_task):
@@ -2115,6 +2301,7 @@ class MainWindow(QMainWindow):
                     return
 
         self._closing = True
+        self._cancel_fetch()
         self._cancel_probes()
         self._save_window_state()
 
@@ -2161,6 +2348,7 @@ def _apply_app_fonts(app: QApplication) -> None:
 
 
 def run_gui() -> None:
+    enable_windows_dpi_awareness()
     _set_windows_app_user_model_id()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

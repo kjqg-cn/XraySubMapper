@@ -728,3 +728,214 @@ def test_cache_read_failure_is_visible_in_gui(window, application, monkeypatch):
         other._force_quit = True
         other.close()
         spin(application, lambda: other._shutdown_complete)
+
+
+def test_hysteria2_badge_filter_and_paste_dialog(window, application, make_node):
+    from core.parser import parse_node_link
+    from gui.widgets import PasteImportDialog, format_proto_badge_text
+
+    plain = parse_node_link("hysteria2://pw@example.com:443#HY2-Plain")
+    obfs = parse_node_link("hy2://pw@example.com:443?obfs=salamander&obfs-password=1#HY2-Obfs")
+    hop = parse_node_link("hy2://pw@example.com:20000-20010#HY2-Hop")
+    both = parse_node_link("hy2://pw@example.com:443?obfs=salamander&obfs-password=1&mport=20000-20010#HY2-Both")
+    assert format_proto_badge_text(plain) == "HY2"
+    assert format_proto_badge_text(obfs) == "HY2 · OBFS"
+    assert format_proto_badge_text(hop) == "HY2 · HOP"
+    assert format_proto_badge_text(both) == "HY2 · OBFS/HOP"
+
+    window._load_new_nodes([make_node("vless-node"), plain, both])
+    window.combo_proto.setValue("hysteria2", emit_signal=True)
+    assert window.proxy_model.rowCount() == 2
+    window.combo_proto.setValue("all", emit_signal=True)
+    assert window.proxy_model.rowCount() == 3
+
+    application.clipboard().setText("hy2://pw@example.com:443#Clip")
+    dialog = PasteImportDialog(window)
+    try:
+        assert dialog.editor.toPlainText() == "hy2://pw@example.com:443#Clip"
+    finally:
+        dialog.close()
+
+
+def test_review_gui_regressions_stale_menu_busy_clear_settings_port_and_reload_title(window, make_node, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+    # H2: defensive single-line export formatting
+    dirty = make_node("safe", 10800)
+    dirty.name = "bad\nhttp://evil:8080"
+    dirty.exit_ip = "1.2.3.4\nfake"
+    line = window._format_node_proxy_line(dirty, "comment")
+    assert "\n" not in line and "\r" not in line
+
+    # H3: replacing nodes while port edit dialog is open must not crash or touch new nodes
+    old_a, old_b = make_node("old-a", 10800), make_node("old-b", 10801)
+    old_b.port_pinned = True
+    window.nodes = [old_a, old_b]
+    window.table_model.set_nodes(window.nodes)
+    fresh = make_node("fresh", 10800)
+
+    def replace_during_dialog(*args, **kwargs):
+        window._load_new_nodes([fresh])
+        return 19999, True
+
+    monkeypatch.setattr(QInputDialog, "getInt", replace_during_dialog)
+    window._prompt_edit_port(old_b)
+    assert fresh.local_port == 10800 and not fresh.port_pinned
+    window._unpin_node_port(old_b)
+    assert fresh.local_port == 10800
+
+    # M8: clearing nodes is blocked while service transition is in progress
+    question = Mock()
+    monkeypatch.setattr(QMessageBox, "question", question)
+    window._set_service_busy(True)
+    try:
+        window._clear_all_nodes()
+        question.assert_not_called()
+        assert len(window.nodes) == 1
+    finally:
+        window._set_service_busy(False)
+
+    # L4: ProxySettingsDialog rejects test_url missing http/https scheme
+    warn = Mock()
+    monkeypatch.setattr("gui.widgets.QMessageBox.warning", warn)
+    dlg = ProxySettingsDialog(False, "", "", "cp.cloudflare.com/generate_204", parent=window)
+    dlg.accept()
+    warn.assert_called_once()
+    assert not dlg.result()
+    dlg.inp_test_url.setText("https://cp.cloudflare.com/generate_204")
+    dlg.accept()
+    assert dlg.result() == dlg.DialogCode.Accepted
+
+    # L5: start port input clamps out-of-range numeric entry instead of staying stuck
+    window.inp_start_port.setText("500")
+    window._on_start_port_edited()
+    assert window.inp_start_port.text() == "1024"
+
+    # L10: reload failure dialog uses dedicated title
+    critical = Mock()
+    monkeypatch.setattr("gui.app.QMessageBox.critical", critical)
+    window._on_service_transitioned(False, "boom", "reload")
+    assert critical.call_args.args[1] == "Xray 配置重载失败"
+
+
+def test_fetch_button_label_and_manual_cancel(window, application, make_node, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    assert "拉取订阅" in window.btn_fetch.text()
+    entered, release = threading.Event(), threading.Event()
+    observed_cancel = []
+
+    def slow_fetch(url, *, cancel_event=None):
+        observed_cancel.append(cancel_event)
+        entered.set()
+        assert release.wait(5)
+        return make_node("late").raw_link, {}
+
+    critical = Mock()
+    monkeypatch.setattr("gui.app.fetch_subscription_with_meta", slow_fetch)
+    monkeypatch.setattr(QMessageBox, "critical", critical)
+    window.inp_url.setText("https://example.com/slow")
+    window._on_fetch_button_clicked()
+    try:
+        assert entered.wait(5)
+        assert window.btn_fetch.isEnabled() and "取消拉取" in window.btn_fetch.text()
+        window._on_fetch_button_clicked()
+        assert "拉取订阅" in window.btn_fetch.text()
+        assert window._fetch_request is None
+        assert observed_cancel[0].is_set()
+        release.set()
+        application.processEvents()
+        assert not window.nodes
+        critical.assert_not_called()
+    finally:
+        release.set()
+
+
+def test_speedtest_marks_testing_and_queued_states_and_clears_on_done_or_cancel(window, application, make_node, monkeypatch):
+    from gui.widgets import COL_LATENCY
+
+    nodes = [make_node(f"n{i}", 19800 + i) for i in range(18)]
+    window._load_new_nodes(nodes)
+    window._applied_signature = window._calc_config_signature()
+    monkeypatch.setattr(window.xray_mgr, "is_running", lambda: True)
+
+    started, release = threading.Event(), threading.Event()
+
+    def fake_test(snapshots, *, progress_cb, start_cb=None, cancel_event=None, **kwargs):
+        if start_cb:
+            start_cb(snapshots[0])
+        started.set()
+        assert release.wait(5)
+        if cancel_event and cancel_event.is_set():
+            return {}
+        for idx, snap in enumerate(snapshots, 1):
+            snap.latency_ms, snap.last_error = 30, ""
+            progress_cb(idx, len(snapshots), snap)
+        return {}
+
+    monkeypatch.setattr(window.xray_mgr, "test_all_proxies", fake_test)
+    window._test_all_speed_async()
+    try:
+        assert started.wait(5)
+        spin(application, lambda: window.nodes[0].probe_state == "testing")
+        assert window.table_model.data(window.table_model.index(0, COL_LATENCY)) == "测速中..."
+        assert window.table_model.data(window.table_model.index(17, COL_LATENCY)) == "排队中"
+        release.set()
+        spin(application, window.btn_speed.isEnabled)
+        assert all(n.probe_state == "" for n in window.nodes)
+        assert window.table_model.data(window.table_model.index(0, COL_LATENCY)) == "30 ms"
+    finally:
+        release.set()
+
+    # Cancel mid-probe must also clear transient states without losing prior latencies
+    started.clear()
+    release.clear()
+    window._test_all_speed_async()
+    try:
+        assert started.wait(5)
+        spin(application, lambda: window.nodes[0].probe_state == "testing")
+        window._cancel_probes()
+        assert all(n.probe_state == "" for n in window.nodes)
+        assert window.nodes[0].latency_ms == 30
+    finally:
+        release.set()
+
+
+def test_r2_gui_placeholder_refresh_empty_fetch_error_and_fallback_testing_state(window, make_node, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from core.parser import parse_clash_proxy
+
+    # R2-H1: refreshing subscription containing a removed-transport placeholder must not crash
+    ph = parse_clash_proxy({"type": "vless", "name": "剩余流量", "server": "127.0.0.1", "port": 1, "network": "h2"})
+    window._load_new_nodes([make_node("a"), ph])
+    window._load_new_nodes([make_node("a"), copy.deepcopy(ph)], preserve_state=True)
+    assert len(window.nodes) == 2 and not window.nodes[1].enabled
+
+    # R2-L1: empty error on failed fetch must not open a blank critical dialog
+    critical = Mock()
+    monkeypatch.setattr(QMessageBox, "critical", critical)
+    req = object()
+    window._fetch_request = req
+    window._on_fetch_finished(req, "https://example.com/sub", None, "")
+    critical.assert_not_called()
+
+    # R2-L2: >16 nodes with an operation lacking start_cb should immediately show testing instead of queued
+    nodes = [make_node(f"m{i}", 19900 + i) for i in range(18)]
+    window._load_new_nodes(nodes)
+    window._applied_signature = window._calc_config_signature()
+    monkeypatch.setattr(window.xray_mgr, "is_running", lambda: True)
+    entered, release = threading.Event(), threading.Event()
+
+    def op_without_start_cb(snapshots, *, progress_cb, cancel_event=None, test_url=""):
+        entered.set()
+        release.wait(5)
+        return {}
+
+    monkeypatch.setattr(window.xray_mgr, "test_all_proxies", op_without_start_cb)
+    window._test_all_speed_async()
+    try:
+        assert entered.wait(5)
+        assert all(n.probe_state == "testing" for n in window.nodes)
+    finally:
+        window._cancel_probes()
+        release.set()

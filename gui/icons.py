@@ -77,7 +77,7 @@ SVG_PATHS: Dict[str, str] = {
     ),
 }
 
-_ICON_CACHE: Dict[Tuple[str, str, int], QIcon] = {}
+_ICON_CACHE: Dict[Tuple[str, str, int, Tuple[float, ...]], QIcon] = {}
 _APP_LOGO_CACHE: Dict[bool, QIcon] = {}
 
 
@@ -87,11 +87,24 @@ def clear_icon_caches() -> None:
     _render_svg_pixmap.cache_clear()
 
 
-def svg_pixmap(name: str, color: str = "#334155", size: int = 16) -> QPixmap:
+def _screen_dprs() -> Tuple[float, ...]:
     app = QGuiApplication.instance()
-    dpr = float(app.primaryScreen().devicePixelRatio()) if (app and app.primaryScreen()) else 1.0
-    dpr = max(1.0, dpr)
-    return QPixmap(_render_svg_pixmap(name, color, size, dpr))
+    if app is None:
+        return (1.0,)
+    screens = app.screens()
+    if not screens:
+        primary = app.primaryScreen()
+        return (max(1.0, float(primary.devicePixelRatio())) if primary else 1.0,)
+    return tuple(sorted({max(1.0, float(s.devicePixelRatio())) for s in screens}))
+
+
+def _current_dpr() -> float:
+    return _screen_dprs()[-1]
+
+
+def svg_pixmap(name: str, color: str = "#334155", size: int = 16, dpr: float = 0.0) -> QPixmap:
+    scale = max(1.0, float(dpr)) if dpr > 0 else _current_dpr()
+    return QPixmap(_render_svg_pixmap(name, color, size, scale))
 
 
 @lru_cache(maxsize=128)
@@ -120,11 +133,14 @@ def _render_svg_pixmap(name: str, color: str, size: int, dpr: float) -> QPixmap:
 
 
 def icon(name: str, color: str = "#334155", size: int = 16) -> QIcon:
-    key = (name, color, size)
+    dprs = _screen_dprs()
+    key = (name, color, size, dprs)
     cached = _ICON_CACHE.get(key)
     if cached is not None:
         return cached
-    ic = QIcon(svg_pixmap(name, color=color, size=size))
+    ic = QIcon()
+    for dpr in dprs:
+        ic.addPixmap(QPixmap(_render_svg_pixmap(name, color, size, dpr)))
     _ICON_CACHE[key] = ic
     return ic
 

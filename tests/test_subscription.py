@@ -4,6 +4,7 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -45,12 +46,12 @@ def test_millisecond_and_second_subscription_expiries_are_equivalent():
 
 @pytest.mark.parametrize("encoded", [False, True])
 def test_unsupported_links_are_reported_without_credentials(encoded):
-    text = "https://example.com/about\n\nhy2://secret@example.com:443\ntuic://password@example.net:443"
+    text = "https://example.com/about\n\nhysteria://secret@example.com:443\ntuic://password@example.net:443"
     if encoded:
         text = base64.b64encode(text.encode()).decode()
     nodes, errors = subscription.parse_subscription_content(text)
     assert not nodes
-    assert errors == ["第 3 行不支持的节点协议: hy2", "第 4 行不支持的节点协议: tuic"]
+    assert errors == ["第 3 行不支持的节点协议: hysteria", "第 4 行不支持的节点协议: tuic"]
 
 
 def test_invalid_clash_yaml_reports_location_without_payload():
@@ -106,3 +107,81 @@ def test_fetch_handles_redirects_and_limits_decompressed_body(monkeypatch):
             server.shutdown()
             worker.join(5)
     assert visited == ["/redirect", "/nodes", "/oversize", "/bad-gateway"]
+
+
+def test_base64_clash_yaml_and_mixed_text_fallback():
+    clash_yaml = "proxies:\n  - {name: b64-clash, type: trojan, server: example.com, port: 443, password: pw}\n"
+    encoded = base64.b64encode(clash_yaml.encode("utf-8")).decode("ascii")
+    nodes, errors = subscription.parse_subscription_content(encoded)
+    assert [n.name for n in nodes] == ["b64-clash"] and not errors
+
+    mixed = '{"meta": true}\ntrojan://pw@example.com:443#from-mixed\n'
+    nodes, errors = subscription.parse_subscription_content(mixed)
+    assert [n.name for n in nodes] == ["from-mixed"] and not errors
+
+    comment_like = "proxies: header-note\ntrojan://pw@example.com:443#from-lines\n"
+    nodes, errors = subscription.parse_subscription_content(comment_like)
+    assert [n.name for n in nodes] == ["from-lines"] and not errors
+
+
+def test_yaml_alias_bomb_is_rejected_safely():
+    lines = ["a: &a [x, x, x, x]"]
+    prev = "a"
+    for idx in range(1, 14):
+        cur = f"k{idx}"
+        lines.append(f"{cur}: &{cur} [*{prev}, *{prev}, *{prev}, *{prev}]")
+        prev = cur
+    lines.append(f"proxies: [*{prev}]")
+    nodes, errors = subscription.parse_subscription_content("\n".join(lines))
+    assert not nodes and len(errors) == 1 and "安全上限" in errors[0]
+
+
+def test_invalid_non_socks_redirect_scheme_does_not_retry(monkeypatch):
+    attempts = []
+
+    def send(self, request, **kwargs):
+        attempts.append(self.trust_env)
+        raise requests.exceptions.InvalidSchema("No connection adapters were found for 'ftp://example.com/sub'")
+
+    monkeypatch.setattr(requests.Session, "send", send)
+    with pytest.raises(requests.exceptions.InvalidSchema):
+        subscription.fetch_subscription_with_meta("http://example.com/sub")
+    assert attempts == [True]
+
+
+def test_fetch_subscription_respects_cancel_event(monkeypatch):
+    cancel = threading.Event()
+    cancel.set()
+    send = Mock()
+    monkeypatch.setattr(requests.Session, "send", send)
+    with pytest.raises(InterruptedError, match="取消"):
+        subscription.fetch_subscription_with_meta("http://example.com/sub", cancel_event=cancel)
+    send.assert_not_called()
+
+
+def test_r2_large_clash_anchors_rules_allowed_and_alias_bomb_with_https_not_swallowed():
+    # 300 nodes reusing YAML anchor must succeed
+    anchor_lines = ["base: &base", "  type: trojan", "  server: example.com", "  port: 443", "  password: pw", "proxies:"]
+    for i in range(300):
+        anchor_lines.append(f"  - {{<<: *base, name: node-{i}}}")
+    nodes, errors = subscription.parse_subscription_content("\n".join(anchor_lines))
+    assert len(nodes) == 300 and not errors
+
+    # Alias bomb with valid YAML block containing https:// (which matches _SHARE_LINK) must still report security limit
+    bomb = ["a: &a [x, x, x, x]"]
+    prev = "a"
+    for idx in range(1, 14):
+        cur = f"k{idx}"
+        bomb.append(f"{cur}: &{cur} [*{prev}, *{prev}, *{prev}, *{prev}]")
+        prev = cur
+    bomb.append("note: |")
+    bomb.append("  https://example.com/decoy")
+    bomb.append(f"proxies: [*{prev}]")
+    nodes, errors = subscription.parse_subscription_content("\n".join(bomb))
+    assert not nodes and len(errors) == 1 and "安全上限" in errors[0]
+
+    # Alias bomb accompanied by a real proxy link line must ALSO report security limit rather than falling back
+    bomb_with_proxy = list(bomb)
+    bomb_with_proxy.insert(-1, "  trojan://pw@example.com:443#decoy")
+    nodes, errors = subscription.parse_subscription_content("\n".join(bomb_with_proxy))
+    assert not nodes and len(errors) == 1 and "安全上限" in errors[0]

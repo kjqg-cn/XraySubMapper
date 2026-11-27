@@ -512,3 +512,153 @@ def test_probe_results_cannot_overwrite_changed_mapping(manager, make_node, monk
     finally:
         release.set()
         thread.join(5)
+
+
+def test_terminate_process_tolerates_windows_access_denied_on_exit():
+    proc = Mock()
+    exited = False
+
+    def poll():
+        return 0 if exited else None
+
+    def terminate():
+        nonlocal exited
+        exited = True
+        raise PermissionError(5, "Access is denied")
+
+    proc.poll.side_effect = poll
+    proc.terminate.side_effect = terminate
+    proc.wait.return_value = 0
+
+    manager_module._terminate_process(proc)
+    proc.terminate.assert_called_once()
+    proc.wait.assert_called_once_with(timeout=2.0)
+
+
+def test_probe_exit_ip_enforces_response_size_limit_and_cancellation(manager, monkeypatch):
+    oversized = manager_module.requests.Response()
+    oversized.status_code = 200
+    oversized._content = b"x" * (manager_module.MAX_PROBE_RESPONSE_BYTES + 1)
+    oversized.close = Mock()
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.get.return_value = oversized
+    monkeypatch.setattr(manager_module.requests, "Session", lambda: session)
+    assert manager.probe_exit_ip(19880) == (False, "")
+
+    cancelled = threading.Event()
+    cancelled.set()
+    session.get.reset_mock()
+    assert manager.probe_exit_ip(19880, cancel_event=cancelled) == (False, "")
+    session.get.assert_not_called()
+
+
+def test_find_xray_executable_ignores_untrusted_cwd(tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    cwd_dir = tmp_path / "downloads"
+    app_dir.mkdir()
+    cwd_dir.mkdir()
+    exe_name = "xray.exe" if sys.platform == "win32" else "xray"
+    (cwd_dir / exe_name).write_bytes(b"fake")
+    monkeypatch.setattr(manager_module, "get_app_dir", lambda: str(app_dir))
+    monkeypatch.chdir(cwd_dir)
+    mgr = manager_module.XrayManager()
+    assert mgr.xray_path == exe_name
+
+
+def test_test_all_proxies_invokes_start_cb_before_probe(manager, make_node, monkeypatch):
+    node = make_node(port=19880)
+    events = []
+
+    def fake_probe(port, **kwargs):
+        events.append(("probe", port))
+        return True, 25, "OK"
+
+    monkeypatch.setattr(manager, "test_single_proxy", fake_probe)
+    manager.test_all_proxies([node], start_cb=lambda n: events.append(("start", n.local_port)))
+    assert events == [("start", 19880), ("probe", 19880)]
+
+
+def test_https_speedtest_measures_second_keepalive_request_and_falls_back_cleanly(manager, monkeypatch):
+    # Verify warmup + timed 2nd request on Keep-Alive HTTPS and fallback on Connection: close / 2nd failure
+    r1 = manager_module.requests.Response()
+    r1.status_code = 204
+    r1.headers["Connection"] = "keep-alive"
+    r1._content = b""
+    r1.close = Mock()
+
+    r2 = manager_module.requests.Response()
+    r2.status_code = 204
+    r2.headers["Connection"] = "keep-alive"
+    r2._content = b""
+    r2.close = Mock()
+
+    ticks = iter([10.0, 10.300, 10.305, 10.365])  # warmup=300ms, 2nd=60ms
+    monkeypatch.setattr(manager_module.time, "perf_counter", lambda: next(ticks))
+
+    session = MagicMock()
+    session.get.side_effect = [r1, r2]
+    ok, lat, msg = manager.test_single_proxy(19880, test_url="https://cp.cloudflare.com/generate_204", session=session)
+    assert ok and lat == 60 and msg == "OK"
+    assert session.get.call_count == 2
+
+    # When 2nd request fails (e.g. server closed idle socket), fall back to verified 1st measurement
+    r_ok = manager_module.requests.Response()
+    r_ok.status_code = 204
+    r_ok._content = b""
+    r_ok.close = Mock()
+    ticks2 = iter([20.0, 20.180, 20.185])
+    monkeypatch.setattr(manager_module.time, "perf_counter", lambda: next(ticks2))
+    session2 = MagicMock()
+    session2.get.side_effect = [r_ok, manager_module.requests.exceptions.ConnectionError("closed")]
+    ok2, lat2, msg2 = manager.test_single_proxy(19880, test_url="https://cp.cloudflare.com/generate_204", session=session2)
+    assert ok2 and lat2 == 180 and msg2 == "OK"
+
+    # Plain HTTP skips 2nd request (single request only)
+    r_http = manager_module.requests.Response()
+    r_http.status_code = 204
+    r_http._content = b""
+    r_http.close = Mock()
+    ticks3 = iter([30.0, 30.120])
+    monkeypatch.setattr(manager_module.time, "perf_counter", lambda: next(ticks3))
+    session3 = MagicMock()
+    session3.get.side_effect = [r_http]
+    ok3, lat3, msg3 = manager.test_single_proxy(19880, test_url="http://cp.cloudflare.com/generate_204", session=session3)
+    assert ok3 and lat3 == 120 and msg3 == "OK"
+    assert session3.get.call_count == 1
+
+
+def test_r2_shared_ssl_adapter_clears_ca_certs_and_speedtest_respects_budget_and_cancel(manager, monkeypatch):
+    from types import SimpleNamespace
+
+    # R2-H2: cert_verify must clear conn.ca_certs so urllib3 never reloads certifi onto shared SSLContext
+    sess = manager_module.requests.Session()
+    try:
+        manager_module._mount_shared_ssl_adapter(sess, manager_module.requests)
+        adapter = sess.get_adapter("https://cp.cloudflare.com/generate_204")
+        conn = SimpleNamespace(cert_reqs=None, ca_certs="stale.pem", ca_cert_dir="dir", ca_cert_data="data")
+        adapter.cert_verify(conn, "https://cp.cloudflare.com/generate_204", True, None)
+        assert conn.cert_reqs == "CERT_REQUIRED"
+        assert conn.ca_certs is None and conn.ca_cert_dir is None and conn.ca_cert_data is None
+    finally:
+        sess.close()
+
+    # R2-M2: cancelled before entry skips all requests
+    cancelled = threading.Event()
+    cancelled.set()
+    session_c = MagicMock()
+    assert manager.test_single_proxy(19880, session=session_c, cancel_event=cancelled) == (False, None, "测速已取消")
+    session_c.get.assert_not_called()
+
+    # R2-M2: warmup exhausting timeout budget skips 2nd request instead of doubling total wait
+    r_slow = manager_module.requests.Response()
+    r_slow.status_code = 204
+    r_slow._content = b""
+    r_slow.close = Mock()
+    ticks = iter([100.0, 104.9])  # remaining = 0.1s <= 0.2s
+    monkeypatch.setattr(manager_module.time, "perf_counter", lambda: next(ticks))
+    session_s = MagicMock()
+    session_s.get.side_effect = [r_slow]
+    ok, lat, msg = manager.test_single_proxy(19880, test_url="https://cp.cloudflare.com/generate_204", timeout=5.0, session=session_s)
+    assert ok and lat == 4900 and msg == "OK"
+    assert session_s.get.call_count == 1

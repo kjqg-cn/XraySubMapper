@@ -41,6 +41,17 @@ proxies:
     network: grpc
     grpc-opts:
       grpc-service-name: "trojan-grpc-svc"
+  - name: "Clash-HY2-Hop"
+    type: hysteria2
+    server: us.example.com
+    ports: 20000-20100
+    hop-interval: 20
+    password: "hy2_password"
+    sni: us.example.com
+    obfs: salamander
+    obfs-password: "obfs_password"
+    up: 50
+    down: 200
   - name: "剩余流量：100GB"
     type: ss
     server: 127.0.0.1
@@ -49,7 +60,7 @@ proxies:
     password: dummy
 """
     c_nodes, c_errors = parse_subscription_content(clash_yaml)
-    assert len(c_nodes) == 3, f"期望 3 个 Clash 节点，实际得到 {len(c_nodes)} ({c_errors})"
+    assert len(c_nodes) == 4, f"期望 4 个 Clash 节点，实际得到 {len(c_nodes)} ({c_errors})"
     vless_ws = c_nodes[0].to_outbound("t0")
     assert vless_ws["streamSettings"]["wsSettings"]["path"] == "/vless-ws"
     assert vless_ws["streamSettings"]["wsSettings"]["host"] == "ws.example.com"
@@ -58,7 +69,10 @@ proxies:
 
     trojan_grpc = c_nodes[1].to_outbound("t1")
     assert trojan_grpc["streamSettings"]["grpcSettings"]["serviceName"] == "trojan-grpc-svc"
-    assert c_nodes[2].enabled is False, "127.0.0.1:1 提示假节点应当自动禁用"
+    hy2_out = c_nodes[2].to_outbound("t2")
+    assert hy2_out["protocol"] == "hysteria"
+    assert [m["type"] for m in hy2_out["streamSettings"]["finalmask"]["udp"]] == ["salamander", "udphop"]
+    assert c_nodes[3].enabled is False, "127.0.0.1:1 提示假节点应当自动禁用"
     print("[+] Clash YAML 解析断言全部通过！")
 
     print("[*] 2. 测试特殊节点链接 (SS2022明文、IPv6、URL编码密码、XHTTP、VMess空aid)...")
@@ -86,11 +100,15 @@ proxies:
         "&fp=chrome&pbk=fgG1NbySPniaSpg0HezhCbPUOQQW62U-xpsDfCBKFSo&sid=12345678&type=tcp#US-Reality"
     )
     ss_b64 = "ss://" + base64.b64encode(b"aes-256-gcm:mypassword@example.com:8388").decode() + "#SG-SS"
+    hy2_url = (
+        f"hy2://hy2pass@example.com:443?sni=example.com&insecure=1&pinSHA256={'aa' * 32}"
+        "&obfs=salamander&obfs-password=salamanderpw&mport=20000-20050&hop-interval=15&upmbps=50&downmbps=150#JP-HY2"
+    )
 
-    raw_sub = "\n".join([vmess_url, vless_reality_url, ss_b64])
+    raw_sub = "\n".join([vmess_url, vless_reality_url, ss_b64, hy2_url])
     b64_sub = base64.b64encode(raw_sub.encode()).decode()
     nodes, errors = parse_subscription_content(b64_sub)
-    assert len(nodes) == 3 and not errors
+    assert len(nodes) == 4 and not errors
 
     meta = parse_subscription_userinfo("upload=1073741824; download=4294967296; total=107374182400; expire=1893456000")
     assert "95.0 GB" in meta["summary"]
@@ -101,6 +119,7 @@ proxies:
     nodes[0].local_port = 19810
     nodes[1].local_port = 19810
     nodes[2].local_port = 19812
+    nodes[3].local_port = 19813
     dup_ok, dup_msg = mgr.validate_node_ports(nodes, "127.0.0.1")
     assert not dup_ok and "重复冲突" in dup_msg, f"未拦截重复端口: {dup_msg}"
 
@@ -115,7 +134,7 @@ proxies:
     assert ok, f"启动失败: {msg}"
     assert mgr.is_running(), "Xray 进程未运行"
 
-    for i in range(3):
+    for i in range(len(nodes)):
         test_p = 19810 + i
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1.0)

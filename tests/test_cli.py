@@ -100,7 +100,7 @@ def test_blank_cli_credentials_are_rejected_before_download(monkeypatch, capsys,
     fetch.assert_not_called()
 
 
-def test_cli_preserves_nonblank_credentials_and_explicit_password(make_node, monkeypatch):
+def test_cli_trims_credentials_and_prefers_explicit_password(make_node, monkeypatch):
     manager = Mock()
     manager.close.return_value = True, "OK"
     handlers = {}
@@ -110,7 +110,7 @@ def test_cli_preserves_nonblank_credentials_and_explicit_password(make_node, mon
     monkeypatch.setattr(cli.signal, "signal", lambda sig, handler: handlers.update({sig: handler}))
 
     def start(nodes, listen_ip, **kwargs):
-        assert kwargs == {"auth_user": " user ", "auth_pass": " pass "}
+        assert kwargs == {"auth_user": "user", "auth_pass": "pass"}
         handlers[cli.signal.SIGINT](cli.signal.SIGINT, None)
         return False, "cancelled"
 
@@ -120,3 +120,41 @@ def test_cli_preserves_nonblank_credentials_and_explicit_password(make_node, mon
                               auth_user=" user ", auth_pass=" pass ")
     cli.run_cli(args)
     manager.close.assert_called_once()
+
+
+@pytest.mark.parametrize("bad_kwargs,expected", [
+    ({"max_nodes": -5, "listen": "127.0.0.1", "start_port": 19890}, "--max-nodes"),
+    ({"max_nodes": 0, "listen": "not-an-ip", "start_port": 19890}, "--listen"),
+    ({"max_nodes": 0, "listen": "127.0.0.1", "start_port": 80}, "--start-port"),
+    ({"max_nodes": 0, "listen": "127.0.0.1", "start_port": 1023}, "--start-port"),
+])
+def test_cli_validates_args_before_download(monkeypatch, capsys, bad_kwargs, expected):
+    fetch = Mock()
+    monkeypatch.setattr(cli, "fetch_subscription_with_meta", fetch)
+    args = argparse.Namespace(sub="https://example.com/sub", file=None,
+                              test=False, export=None, auth_user=None, auth_pass=None, **bad_kwargs)
+    with pytest.raises(SystemExit) as err:
+        cli.run_cli(args)
+    assert err.value.code == 1
+    assert expected in capsys.readouterr().out
+    fetch.assert_not_called()
+
+
+def test_cli_export_sanitizes_newlines_in_node_name(tmp_path, make_node, monkeypatch):
+    node = make_node()
+    node.name = "HK\nhttp://evil:8080"
+    target = tmp_path / "proxies.txt"
+    manager = Mock()
+    manager.start.return_value = manager.close.return_value = (True, "OK")
+    manager.is_running.return_value = False
+    monkeypatch.setattr(cli, "XrayManager", lambda **kwargs: manager)
+    monkeypatch.setattr(cli, "parse_subscription_content", lambda text: ([node], []))
+    monkeypatch.setattr(cli, "fetch_subscription_with_meta", lambda url: ("synthetic", {}))
+    monkeypatch.setattr(cli.signal, "signal", lambda *args: None)
+    args = argparse.Namespace(sub="https://example.com/sub", file=None, start_port=19890,
+                              listen="127.0.0.1", max_nodes=0, test=False, export=str(target),
+                              auth_user=None, auth_pass=None)
+    with pytest.raises(SystemExit):
+        cli.run_cli(args)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and "HK http://evil:8080" in lines[0]

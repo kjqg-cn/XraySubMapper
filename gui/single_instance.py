@@ -1,5 +1,6 @@
 import ctypes
 import sys
+import time
 from functools import lru_cache
 from typing import Optional
 
@@ -9,6 +10,7 @@ _ACTIVATION_MESSAGE = "XraySubMapper.Desktop.Activate"
 _ERROR_ACCESS_DENIED = 5
 _ERROR_ALREADY_EXISTS = 183
 _SYNCHRONIZE = 0x00100000
+_MSGFLT_ALLOW = 1
 
 
 class GuiInstanceLock:
@@ -59,16 +61,42 @@ def activation_message_id() -> int:
     return register(_ACTIVATION_MESSAGE)
 
 
-def activate_existing_window(title: str) -> bool:
+def allow_activation_message(hwnd: int) -> bool:
+    """Allow custom activation messages across Windows UIPI boundaries (e.g. elevated primary instance)."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    message = activation_message_id()
+    if not message:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        change_filter = user32.ChangeWindowMessageFilterEx
+        change_filter.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        change_filter.restype = ctypes.c_int
+        return bool(change_filter(ctypes.c_void_p(hwnd), message, _MSGFLT_ALLOW, None))
+    except Exception:
+        return False
+
+
+def activate_existing_window(title: str, *, retries: int = 5, retry_delay: float = 0.1) -> bool:
     if sys.platform != "win32":
         return False
     user32 = ctypes.windll.user32
     find_window = user32.FindWindowW
     find_window.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
     find_window.restype = ctypes.c_void_p
-    hwnd = find_window(None, title)
     message = activation_message_id()
-    if not hwnd or not message:
+    if not message:
+        return False
+    hwnd = None
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        hwnd = find_window(None, title)
+        if hwnd:
+            break
+        if attempt + 1 < attempts and retry_delay > 0:
+            time.sleep(retry_delay)
+    if not hwnd:
         return False
     process_id = ctypes.c_uint32()
     get_process = user32.GetWindowThreadProcessId

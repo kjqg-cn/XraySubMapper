@@ -50,10 +50,50 @@ def generate_multi_size_ico(ico_path: str) -> None:
     _ = app
 
 
+def write_windows_manifest(manifest_path: str) -> None:
+    """Write a Windows application manifest declaring PerMonitorV2 DPI awareness and long paths."""
+    manifest_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
+"""
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        f.write(manifest_xml)
+
+
 def build() -> None:
     build_work_dir = os.path.join(ROOT_DIR, "build")
     release_dir = os.path.join(ROOT_DIR, "release")
     ico_path = os.path.join(build_work_dir, "app_logo.ico")
+    manifest_path = os.path.join(build_work_dir, "XraySubMapper.manifest")
     xray_bin = os.path.join(ROOT_DIR, "xray.exe")
 
     if not os.path.isfile(xray_bin):
@@ -63,8 +103,9 @@ def build() -> None:
         raise SystemExit(f"无法打包 {xray_bin}\n{version}")
 
     print(f"Bundling Xray {version}")
-    print("[1/3] Generating multi-resolution Windows icon (16..256px)...")
+    print("[1/3] Generating multi-resolution Windows icon (16..256px) and PerMonitorV2 manifest...")
     generate_multi_size_ico(ico_path)
+    write_windows_manifest(manifest_path)
 
     excludes = [
         "PySide6.QtWebEngineCore",
@@ -168,6 +209,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=[{ico_path!r}],
+    manifest={manifest_path!r},
 )
 """
     os.makedirs(build_work_dir, exist_ok=True)

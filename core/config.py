@@ -18,6 +18,28 @@ def get_app_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def enable_windows_dpi_awareness() -> None:
+    """Request Windows PerMonitorV2 DPI awareness before any native dialog or GUI creation."""
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        set_ctx = user32.SetProcessDpiAwarenessContext
+        set_ctx.argtypes = [ctypes.c_void_p]
+        set_ctx.restype = ctypes.c_int
+        ctypes.set_last_error(0)
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (DPI_AWARENESS_CONTEXT)-4
+        if set_ctx(ctypes.c_void_p(-4)) or ctypes.get_last_error() == 5:
+            # 5 == ERROR_ACCESS_DENIED (already declared by application manifest / earlier call).
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+
+
 BASE_DIR = get_app_dir()
 CONFIG_FILE = os.path.join(BASE_DIR, "app_settings.json")
 NODES_CACHE_FILE = os.path.join(BASE_DIR, "cached_nodes.json")
@@ -117,10 +139,11 @@ def _backup_cache(file_path: str) -> str:
     if not protected:
         raw = json.dumps(_protect_bytes(raw)).encode("utf-8")
 
+    parent = os.path.dirname(os.path.abspath(file_path))
     backup_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb", dir=os.path.dirname(file_path), prefix=f"{os.path.basename(file_path)}.",
+            mode="wb", dir=parent, prefix=f"{os.path.basename(file_path)}.",
             suffix=".bak", delete=False,
         ) as backup:
             backup_path = backup.name
@@ -136,30 +159,33 @@ def _backup_cache(file_path: str) -> str:
 
 
 def _atomic_write_json(file_path: str, payload: Any, *, replace_unreadable: bool = False) -> str:
-    key = os.path.normcase(os.path.abspath(file_path))
+    abs_path = os.path.abspath(file_path)
+    parent = os.path.dirname(abs_path)
+    key = os.path.normcase(abs_path)
     with _WRITE_LOCK:
-        protected = key in _UNREADABLE_FILES and os.path.exists(file_path)
+        protected = key in _UNREADABLE_FILES and os.path.exists(abs_path)
         if protected and not replace_unreadable:
             raise OSError("原缓存已受保护，已阻止覆盖。可通过主动导入、清空或保存设置替换")
         envelope = _protect_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        os.makedirs(parent, exist_ok=True)
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=os.path.dirname(file_path),
-                prefix=f"{os.path.basename(file_path)}.", suffix=".tmp", delete=False,
+                mode="w", encoding="utf-8", dir=parent,
+                prefix=f"{os.path.basename(abs_path)}.", suffix=".tmp", delete=False,
             ) as f:
                 tmp_path = f.name
                 json.dump(envelope, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            backup_path = _backup_cache(file_path) if protected else ""
-            os.replace(tmp_path, file_path)
+            backup_path = _backup_cache(abs_path) if protected else ""
+            os.replace(tmp_path, abs_path)
             _UNREADABLE_FILES.discard(key)
             return backup_path
         finally:
             if tmp_path is not None and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+                with suppress(OSError):
+                    os.unlink(tmp_path)
 
 
 def load_settings() -> Dict[str, Any]:

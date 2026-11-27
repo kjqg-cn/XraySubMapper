@@ -7,6 +7,7 @@ import re
 import select
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -148,13 +149,145 @@ def _assign_process_to_job(job_handle: Optional[int], proc: subprocess.Popen) ->
 
 
 def _terminate_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is None:
+    if proc.poll() is not None:
+        return
+    with suppress(OSError):
         proc.terminate()
-        try:
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
+    try:
+        proc.wait(timeout=2.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        with suppress(OSError):
             proc.kill()
+        try:
             proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            if proc.poll() is None:
+                raise
+
+
+MAX_PROBE_RESPONSE_BYTES = 64 * 1024
+
+
+_SSL_CTX_LOCK = threading.Lock()
+_SHARED_SSL_CONTEXT: Optional[ssl.SSLContext] = None
+_SHARED_SSL_ADAPTER_CLS: Optional[type] = None
+_WARMUP_DRAIN_LIMIT = 64 * 1024
+
+
+def _get_shared_ssl_context() -> ssl.SSLContext:
+    """Build and reuse a single CA-loaded SSLContext across concurrent speedtest workers."""
+    global _SHARED_SSL_CONTEXT
+    if _SHARED_SSL_CONTEXT is not None:
+        return _SHARED_SSL_CONTEXT
+    with _SSL_CTX_LOCK:
+        if _SHARED_SSL_CONTEXT is None:
+            cafile = None
+            try:
+                import certifi
+
+                cafile = certifi.where()
+            except Exception:
+                pass
+            _SHARED_SSL_CONTEXT = ssl.create_default_context(cafile=cafile)
+        return _SHARED_SSL_CONTEXT
+
+
+def _get_shared_ssl_adapter_cls(req_mod: Any) -> Optional[type]:
+    global _SHARED_SSL_ADAPTER_CLS
+    if _SHARED_SSL_ADAPTER_CLS is not None:
+        return _SHARED_SSL_ADAPTER_CLS
+    try:
+        adapter_cls = req_mod.adapters.HTTPAdapter
+    except AttributeError:
+        return None
+    with _SSL_CTX_LOCK:
+        if _SHARED_SSL_ADAPTER_CLS is None:
+            class _SharedSSLAdapter(adapter_cls):  # type: ignore[misc,valid-type]
+                def __init__(self, *args: Any, **kwargs: Any):
+                    self._shared_ctx = _get_shared_ssl_context()
+                    super().__init__(*args, **kwargs)
+
+                def init_poolmanager(self, *args: Any, **kwargs: Any):
+                    kwargs["ssl_context"] = self._shared_ctx
+                    return super().init_poolmanager(*args, **kwargs)
+
+                def proxy_manager_for(self, *args: Any, **kwargs: Any):
+                    kwargs["ssl_context"] = self._shared_ctx
+                    return super().proxy_manager_for(*args, **kwargs)
+
+                def cert_verify(self, conn: Any, url: str, verify: Any, cert: Any) -> None:
+                    # Keep urllib3 from reloading certifi CA bundle onto the shared SSLContext on every handshake.
+                    if verify is True and not cert:
+                        conn.cert_reqs = "CERT_REQUIRED"
+                        conn.ca_certs = None
+                        conn.ca_cert_dir = None
+                        conn.ca_cert_data = None
+                        return
+                    super().cert_verify(conn, url, verify, cert)
+
+            _SHARED_SSL_ADAPTER_CLS = _SharedSSLAdapter
+        return _SHARED_SSL_ADAPTER_CLS
+
+
+def _mount_shared_ssl_adapter(sess: Any, req_mod: Any) -> None:
+    cls = _get_shared_ssl_adapter_cls(req_mod)
+    if cls is not None:
+        sess.mount("https://", cls(pool_connections=1, pool_maxsize=1))
+
+
+def _drain_response_for_reuse(
+    resp: Any,
+    max_bytes: int = _WARMUP_DRAIN_LIMIT,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    deadline: Optional[float] = None,
+) -> bool:
+    """Drain a small response body so urllib3 returns the Keep-Alive CONNECT socket to the pool."""
+    if cancel_event is not None and cancel_event.is_set():
+        return False
+    headers = getattr(resp, "headers", None) or {}
+    if str(headers.get("Connection", "")).lower() == "close":
+        return False
+    content_length = str(headers.get("Content-Length", "")).strip()
+    if content_length.isdigit() and int(content_length) > max_bytes:
+        return False
+    cached = getattr(resp, "_content", None)
+    if isinstance(cached, (bytes, bytearray)):
+        return len(cached) <= max_bytes
+    total = 0
+    for chunk in resp.iter_content(chunk_size=8192):
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if deadline is not None and time.perf_counter() >= deadline:
+            return False
+        total += len(chunk)
+        if total > max_bytes:
+            return False
+    return True
+
+
+def _read_limited_text(
+    resp: Any,
+    max_bytes: int = MAX_PROBE_RESPONSE_BYTES,
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
+    """Read HTTP probe body with a strict size cap, supporting streamed and pre-populated mock responses."""
+    cached = getattr(resp, "_content", None)
+    if isinstance(cached, (bytes, bytearray)):
+        if len(cached) > max_bytes:
+            raise ValueError(f"探测响应体超过大小上限 ({max_bytes} 字节)")
+        return bytes(cached).decode(resp.encoding or "utf-8", errors="replace")
+    buf = bytearray()
+    for chunk in resp.iter_content(chunk_size=8192):
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("探测已取消")
+        if len(buf) + len(chunk) > max_bytes:
+            raise ValueError(f"探测响应体超过大小上限 ({max_bytes} 字节)")
+        buf.extend(chunk)
+    return buf.decode(resp.encoding or "utf-8", errors="replace")
 
 
 def _connect_host(listen_ip: str) -> str:
@@ -287,7 +420,6 @@ class XrayManager:
 
     def _find_xray_executable(self) -> str:
         app_dir = get_app_dir()
-        current_dir = os.getcwd()
         exe_name = "xray.exe" if sys.platform == "win32" else "xray"
         candidates = [
             # 1. External xray.exe next to the portable .exe / project root (allows easy kernel upgrade)
@@ -297,10 +429,6 @@ class XrayManager:
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             candidates.append(os.path.join(meipass, exe_name))
-        candidates.extend([
-            os.path.join(current_dir, exe_name),
-            exe_name,
-        ])
         for p in candidates:
             if os.path.isfile(p):
                 return os.path.abspath(p)
@@ -644,7 +772,8 @@ class XrayManager:
 
             host = _connect_host(listen_ip)
             pending = deque(node.local_port for node in active_nodes)
-            deadline = time.monotonic() + 5
+            ready_timeout = max(5.0, min(20.0, 5.0 + len(active_nodes) * 0.02))
+            deadline = time.monotonic() + ready_timeout
             while pending:
                 if self._is_cancelled():
                     raise InterruptedError("启动已取消")
@@ -802,26 +931,58 @@ class XrayManager:
         host: Optional[str] = None,
         session: Optional["requests.Session"] = None,
         proxy_url: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[bool, Optional[int], str]:
-        """Test a local HTTP proxy port over HTTPS CONNECT tunnel."""
+        """
+        Test a local HTTP proxy port and measure real end-to-end RTT.
+        For HTTPS URLs, performs a warmup CONNECT request and times a 2nd Keep-Alive
+        request over the exact same tunnel so cold TCP/proxy/TLS handshakes do not
+        inflate latency by 3x-5x.
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            return False, None, "测速已取消"
         req = _get_requests()
         proxy_url = proxy_url or self._build_proxy_url(local_port, host=host)
         proxies = {"http": proxy_url, "https": proxy_url}
-        start_t = time.perf_counter()
 
         own_session = session is None
         sess = session or req.Session()
         sess.trust_env = False
+        is_https = test_url.lower().startswith("https://")
+        if own_session and is_https:
+            _mount_shared_ssl_adapter(sess, req)
 
         try:
+            start_t = time.perf_counter()
+            deadline = start_t + timeout
+            reusable = False
             with sess.get(
                 test_url, proxies=proxies, timeout=timeout, allow_redirects=False, stream=True,
                 hooks={"response": discard_redirect_body},
             ) as resp:
-                if 200 <= resp.status_code < 400:
-                    cost_ms = max(1, int((time.perf_counter() - start_t) * 1000))
-                    return True, cost_ms, "OK"
-                return False, None, f"HTTP {resp.status_code}"
+                if not (200 <= resp.status_code < 400):
+                    return False, None, f"HTTP {resp.status_code}"
+                first_done = time.perf_counter()
+                cost_ms = max(1, int(round((first_done - start_t) * 1000)))
+                if is_https:
+                    reusable = _drain_response_for_reuse(
+                        resp, cancel_event=cancel_event, deadline=deadline,
+                    )
+
+            remaining = deadline - first_done
+            if reusable and remaining > 0.2 and not (cancel_event is not None and cancel_event.is_set()):
+                try:
+                    t2 = time.perf_counter()
+                    with sess.get(
+                        test_url, proxies=proxies, timeout=min(2.5, remaining), allow_redirects=False, stream=True,
+                        hooks={"response": discard_redirect_body},
+                    ) as resp2:
+                        if 200 <= resp2.status_code < 400:
+                            cost_ms = max(1, int(round((time.perf_counter() - t2) * 1000)))
+                except Exception:
+                    # Keep the verified warmup measurement if the remote closed the idle socket.
+                    pass
+            return True, cost_ms, "OK"
         except req.exceptions.Timeout:
             return False, None, "连接超时"
         except req.exceptions.SSLError:
@@ -839,6 +1000,7 @@ class XrayManager:
         timeout: float = 5.0,
         progress_cb: Optional[Callable[[int, int, ProxyNode], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        start_cb: Optional[Callable[[ProxyNode], None]] = None,
     ) -> Dict[int, Tuple[bool, Optional[int], str]]:
         """Concurrently test latency for all enabled nodes."""
         results: Dict[int, Tuple[bool, Optional[int], str]] = {}
@@ -856,7 +1018,14 @@ class XrayManager:
             if cancel_event is not None and cancel_event.is_set():
                 return
             node, port, key, proxy_url = item
-            ok, lat, msg = self.test_single_proxy(port, test_url=test_url, timeout=timeout, proxy_url=proxy_url)
+            if start_cb is not None:
+                start_cb(node)
+            probe_kwargs: Dict[str, Any] = {"test_url": test_url, "timeout": timeout, "proxy_url": proxy_url}
+            if cancel_event is not None:
+                probe_kwargs["cancel_event"] = cancel_event
+            ok, lat, msg = self.test_single_proxy(port, **probe_kwargs)
+            if cancel_event is not None and cancel_event.is_set():
+                return
             current = (generation == self.generation and node.enabled
                        and node.local_port == port and node.connection_key() == key)
             if current:
@@ -869,14 +1038,26 @@ class XrayManager:
                     progress_cb(done_counter[0], total, node)
 
         with ThreadPoolExecutor(max_workers=min(16, total)) as pool:
-            list(pool.map(_worker, active_nodes))
+            futures = [pool.submit(_worker, item) for item in active_nodes]
+            for fut in futures:
+                if cancel_event is not None and cancel_event.is_set():
+                    for pending_fut in futures:
+                        pending_fut.cancel()
+                    break
+                fut.result()
 
         return results
 
     def probe_exit_ip(
-        self, local_port: int, timeout: float = 6.0, proxy_url: Optional[str] = None,
+        self,
+        local_port: int,
+        timeout: float = 6.0,
+        proxy_url: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[bool, str]:
         """Query outbound exit IP and country code through the mapped local HTTP proxy."""
+        if cancel_event is not None and cancel_event.is_set():
+            return False, ""
         req = _get_requests()
         proxy_url = proxy_url or self._build_proxy_url(local_port)
         proxies = {"http": proxy_url, "https": proxy_url}
@@ -884,28 +1065,43 @@ class XrayManager:
             sess.trust_env = False
             # Primary: Cloudflare trace (fast, returns both IP and 2-letter country code)
             try:
-                with sess.get("https://cp.cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=timeout) as resp:
+                with sess.get(
+                    "https://cp.cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=timeout, stream=True,
+                ) as resp:
                     if resp.status_code == 407:
                         return False, ""
-                    if resp.status_code == 200 and "ip=" in resp.text:
-                        kv = {}
-                        for line in resp.text.splitlines():
-                            if "=" in line:
-                                k, v = line.split("=", 1)
-                                kv[k.strip()] = v.strip()
-                        ip = kv.get("ip", "")
-                        loc = kv.get("loc", "")
-                        if ip:
-                            return True, f"{ip} ({loc})" if loc else ip
+                    if resp.status_code == 200:
+                        body = _read_limited_text(resp, cancel_event=cancel_event)
+                        if "ip=" in body:
+                            kv = {}
+                            for line in body.splitlines():
+                                if "=" in line:
+                                    k, v = line.split("=", 1)
+                                    kv[k.strip()] = v.strip()
+                            ip = kv.get("ip", "")
+                            loc = kv.get("loc", "")
+                            if ip:
+                                return True, f"{ip} ({loc})" if loc else ip
+            except InterruptedError:
+                return False, ""
             except req.RequestException as exc:
                 if _local_proxy_error(exc):
                     return False, ""
+            except ValueError:
+                pass
+
+            if cancel_event is not None and cancel_event.is_set():
+                return False, ""
 
             # Fallback: ipify
             try:
-                with sess.get("https://api.ipify.org?format=json", proxies=proxies, timeout=timeout) as resp:
+                with sess.get(
+                    "https://api.ipify.org?format=json", proxies=proxies, timeout=timeout, stream=True,
+                ) as resp:
                     if resp.status_code == 200:
-                        ip = str(resp.json().get("ip", "")).strip()
+                        body = _read_limited_text(resp, cancel_event=cancel_event)
+                        data = json.loads(body)
+                        ip = str(data.get("ip", "")).strip() if isinstance(data, dict) else ""
                         if ip:
                             return True, ip
             except Exception:
@@ -933,7 +1129,12 @@ class XrayManager:
             if cancel_event is not None and cancel_event.is_set():
                 return
             node, port, key, proxy_url = item
-            ok, ip_info = self.probe_exit_ip(port, proxy_url=proxy_url)
+            kwargs: Dict[str, Any] = {"proxy_url": proxy_url}
+            if cancel_event is not None:
+                kwargs["cancel_event"] = cancel_event
+            ok, ip_info = self.probe_exit_ip(port, **kwargs)
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if (generation == self.generation and node.enabled
                     and node.local_port == port and node.connection_key() == key):
                 node.exit_ip = ip_info if ok else ""
@@ -943,4 +1144,10 @@ class XrayManager:
                     progress_cb(done_counter[0], total, node)
 
         with ThreadPoolExecutor(max_workers=min(12, total)) as pool:
-            list(pool.map(_worker, active_nodes))
+            futures = [pool.submit(_worker, item) for item in active_nodes]
+            for fut in futures:
+                if cancel_event is not None and cancel_event.is_set():
+                    for pending_fut in futures:
+                        pending_fut.cancel()
+                    break
+                fut.result()

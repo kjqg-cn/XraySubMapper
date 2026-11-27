@@ -7,20 +7,41 @@ import threading
 import time
 from urllib.parse import quote
 
+from core.parser import sanitize_single_line
 from core.subscription import fetch_subscription_with_meta, parse_subscription_content
 from core.xray_manager import XrayManager, format_proxy_host
 
 
 def run_cli(args: argparse.Namespace) -> None:
-    auth_user = getattr(args, "auth_user", None)
-    auth_pass = getattr(args, "auth_pass", None)
-    if auth_user and auth_pass is None:
-        auth_pass = os.environ.get("XRAY_AUTH_PASS")
-    if (auth_user is not None or auth_pass is not None) and not (
-        auth_user and auth_user.strip() and auth_pass and auth_pass.strip()
-    ):
+    raw_user = getattr(args, "auth_user", None)
+    raw_pass = getattr(args, "auth_pass", None)
+    if raw_user and raw_pass is None:
+        raw_pass = os.environ.get("XRAY_AUTH_PASS")
+    auth_user = raw_user.strip() if isinstance(raw_user, str) else ""
+    auth_pass = raw_pass.strip() if isinstance(raw_pass, str) else ""
+    if (raw_user is not None or raw_pass is not None) and not (auth_user and auth_pass):
         print("[-] 请提供 --auth-user 和 --auth-pass（也可通过 XRAY_AUTH_PASS 设置密码）")
         sys.exit(1)
+
+    max_nodes = getattr(args, "max_nodes", 0)
+    if max_nodes is not None and max_nodes < 0:
+        print(f"[-] 错误: --max-nodes 不能为负数 ({max_nodes})")
+        sys.exit(1)
+
+    start_p = getattr(args, "start_port", 10800)
+    if start_p < 1024 or start_p > 65535:
+        print(f"[-] 错误: --start-port 须在 1024~65535 之间 ({start_p})")
+        sys.exit(1)
+
+    listen_ip = getattr(args, "listen", "127.0.0.1")
+    try:
+        loopback = ipaddress.ip_address(listen_ip).is_loopback
+    except ValueError:
+        if listen_ip.lower() == "localhost":
+            loopback = True
+        else:
+            print(f"[-] 错误: --listen 监听地址无效 ({listen_ip})，请提供有效的 IPv4/IPv6 地址或 localhost")
+            sys.exit(1)
 
     content = ""
     if args.sub:
@@ -57,21 +78,15 @@ def run_cli(args: argparse.Namespace) -> None:
     if errors:
         print(f"[*] 忽略 {len(errors)} 个异常节点。")
 
-    if args.max_nodes and args.max_nodes > 0:
-        active_nodes = active_nodes[: args.max_nodes]
+    if max_nodes and max_nodes > 0:
+        active_nodes = active_nodes[:max_nodes]
         print(f"[*] 限制映射前 {len(active_nodes)} 个节点。")
 
-    start_p = args.start_port
-    if start_p < 1 or start_p + len(active_nodes) - 1 > 65535:
-        print(f"[-] 错误: 端口区间越界 ({start_p} ~ {start_p + len(active_nodes) - 1})，须在 1~65535 之间。")
+    if start_p + len(active_nodes) - 1 > 65535:
+        print(f"[-] 错误: 端口区间越界 ({start_p} ~ {start_p + len(active_nodes) - 1})，须在 1024~65535 之间。")
         sys.exit(1)
 
-    listen_ip = args.listen
     export_host = format_proxy_host(listen_ip)
-    try:
-        loopback = ipaddress.ip_address(listen_ip).is_loopback
-    except ValueError:
-        loopback = listen_ip.lower() == "localhost"
     if not loopback and not auth_user:
         print("[!] 当前监听地址可供其他设备访问，建议启用代理鉴权。")
 
@@ -129,8 +144,11 @@ def run_cli(args: argparse.Namespace) -> None:
                     for node in export_candidates:
                         latency = node.latency_ms
                         suffix = f" [{latency}ms]" if latency is not None and latency >= 0 else ""
-                        f.write(f"http://{auth_prefix}{export_host}:{node.local_port} # {node.name}{suffix}\n")
+                        safe_name = sanitize_single_line(node.name)
+                        f.write(f"http://{auth_prefix}{export_host}:{node.local_port} # {safe_name}{suffix}\n")
                 print(f"[+] 代理映射列表 ({len(export_candidates)} 条) 已保存至: {args.export}")
+                if auth_user:
+                    print("[*] 提示: 导出文件包含明文本地代理账号密码，请妥善保管。")
             except OSError as exc:
                 print(f"[-] 导出文件失败: {exc}")
 

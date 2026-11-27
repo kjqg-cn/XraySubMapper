@@ -1,5 +1,6 @@
 import re
 from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.parser import ProxyNode
+from core.xray_manager import format_proxy_host
 from .icons import icon, svg_pixmap
 
 COL_ENABLED = 0
@@ -68,6 +70,7 @@ PROTO_STYLES: Dict[str, Tuple[str, str, str]] = {
     "shadowsocks": ("#ECFEFF", "#0E7490", "#CFFAFE"),
     "ss": ("#ECFEFF", "#0E7490", "#CFFAFE"),
     "socks": ("#F1F5F9", "#475569", "#E2E8F0"),
+    "hysteria2": ("#FFF1F2", "#BE123C", "#FFE4E6"),
 }
 
 REGION_KEYWORDS: List[Tuple[Tuple[str, ...], str]] = [
@@ -128,6 +131,13 @@ def extract_region_and_clean_name(raw_name: str) -> Tuple[str, str]:
 
 
 def format_proto_badge_text(node: ProxyNode) -> str:
+    if node.protocol == "hysteria2":
+        tags = []
+        if getattr(node, "obfs", ""):
+            tags.append("OBFS")
+        if getattr(node, "mport", ""):
+            tags.append("HOP")
+        return f"HY2 · {'/'.join(tags)}" if tags else "HY2"
     base = "SS" if node.protocol == "shadowsocks" else node.protocol.upper()
     sec = getattr(node, "security", "").lower()
     net = getattr(node, "network", "").lower()
@@ -169,9 +179,10 @@ class NodeTableModel(QAbstractTableModel):
             bot = self.index(len(self.nodes) - 1, self.columnCount() - 1)
             self.dataChanged.emit(top, bot)
 
-    def refresh_row(self, row: int) -> None:
+    def refresh_row(self, row: int, *, recalc_conflicts: bool = True) -> None:
         if 0 <= row < len(self.nodes):
-            self._recalc_conflicts()
+            if recalc_conflicts:
+                self._recalc_conflicts()
             self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
 
     def _recalc_conflicts(self) -> None:
@@ -221,7 +232,7 @@ class NodeTableModel(QAbstractTableModel):
         if role == ROLE_CONFLICT:
             return node.enabled and (node.local_port in self._conflict_ports)
         if role == ROLE_LISTEN_IP:
-            return "127.0.0.1" if self.listen_ip == "0.0.0.0" else self.listen_ip
+            return format_proxy_host(self.listen_ip)
 
         if role == ROLE_SORT:
             if col == COL_ENABLED:
@@ -250,7 +261,7 @@ class NodeTableModel(QAbstractTableModel):
             if col == COL_NAME:
                 return node.name
             if col == COL_LOCAL:
-                host_disp = "127.0.0.1" if self.listen_ip == "0.0.0.0" else self.listen_ip
+                host_disp = format_proxy_host(self.listen_ip)
                 if node.enabled and node.local_port in self._conflict_ports:
                     return f"端口 {node.local_port} 存在重复冲突！双击修改端口"
                 pin_tip = "\n• 已手动锁定端口，顺延重排时自动保留" if node.port_pinned else ""
@@ -262,8 +273,14 @@ class NodeTableModel(QAbstractTableModel):
                         f"{pin_tip}\n(双击单元格可直接修改端口)"
                     )
                 return "启用后自动分配本地混合代理端口 (HTTP + SOCKS5)"
-            if col == COL_LATENCY and node.latency_ms == -1 and node.last_error:
-                return f"测速失败原因: {node.last_error}"
+            if col == COL_LATENCY:
+                state = getattr(node, "probe_state", "")
+                if state == "testing":
+                    return "正在测试该本地代理端口的 HTTPS 连通性与延迟..."
+                if state == "queued":
+                    return "正在排队等待测速..."
+                if node.latency_ms == -1 and node.last_error:
+                    return f"测速失败原因: {node.last_error}"
             if col == COL_PROTO:
                 return f"协议与传输层: {format_proto_badge_text(node)}"
             if col == COL_REMOTE:
@@ -281,9 +298,14 @@ class NodeTableModel(QAbstractTableModel):
             if col == COL_REMOTE:
                 return f"{node.server}:{node.port}"
             if col == COL_LOCAL:
-                host_disp = "127.0.0.1" if self.listen_ip == "0.0.0.0" else self.listen_ip
+                host_disp = format_proxy_host(self.listen_ip)
                 return f"http://{host_disp}:{node.local_port}" if (node.enabled and node.local_port > 0) else "--"
             if col == COL_LATENCY:
+                state = getattr(node, "probe_state", "")
+                if node.enabled and state == "testing":
+                    return "测速中..."
+                if node.enabled and state == "queued":
+                    return "排队中"
                 if node.latency_ms is None:
                     return "--"
                 return f"{node.latency_ms} ms" if node.latency_ms >= 0 else (node.last_error or "失败")
@@ -572,10 +594,11 @@ class NodeTableDelegate(QStyledItemDelegate):
             )
             painter.setFont(self.font_badge)
             painter.setPen(QColor("#059669"))
+            fm_badge = QFontMetrics(self.font_badge)
             painter.drawText(
                 bot_r,
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                f"出口 {node.exit_ip}",
+                fm_badge.elidedText(f"出口 {node.exit_ip}", Qt.TextElideMode.ElideMiddle, bot_r.width()),
             )
         else:
             painter.setPen(QColor("#475569") if enabled else QColor("#CBD5E1"))
@@ -620,54 +643,75 @@ class NodeTableDelegate(QStyledItemDelegate):
         w_prefix = fm_reg.horizontalAdvance(prefix)
         w_port = fm_bold.horizontalAdvance(port_str)
         start_x = rect.x() + 14
+        right_pad = 26 if node.port_pinned else 12
+        avail_w = max(0, rect.right() - right_pad - start_x)
 
-        painter.setPen(QColor("#DC2626") if is_conflict else QColor("#64748B"))
-        painter.drawText(
-            QRect(start_x, rect.y(), w_prefix + 2, rect.height()),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            prefix,
-        )
-
-        painter.setFont(self.font_mono_bold)
-        painter.setPen(QColor("#B91C1C") if is_conflict else QColor("#0F172A"))
-        painter.drawText(
-            QRect(start_x + w_prefix, rect.y(), w_port + 4, rect.height()),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            port_str,
-        )
+        if w_prefix + w_port <= avail_w:
+            painter.setPen(QColor("#DC2626") if is_conflict else QColor("#64748B"))
+            painter.drawText(
+                QRect(start_x, rect.y(), w_prefix + 2, rect.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                prefix,
+            )
+            painter.setFont(self.font_mono_bold)
+            painter.setPen(QColor("#B91C1C") if is_conflict else QColor("#0F172A"))
+            painter.drawText(
+                QRect(start_x + w_prefix, rect.y(), w_port + 4, rect.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                port_str,
+            )
+            text_end_x = start_x + w_prefix + w_port
+        else:
+            elided_full = fm_bold.elidedText(f"{prefix}{port_str}", Qt.TextElideMode.ElideLeft, avail_w)
+            painter.setFont(self.font_mono_bold)
+            painter.setPen(QColor("#B91C1C") if is_conflict else QColor("#0F172A"))
+            painter.drawText(
+                QRect(start_x, rect.y(), avail_w, rect.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                elided_full,
+            )
+            text_end_x = start_x + avail_w
 
         if node.port_pinned:
             pin_px = svg_pixmap("pin", color="#2563EB", size=12)
             py = int(rect.y() + (rect.height() - 12) / 2)
-            px = min(rect.right() - 20, start_x + w_prefix + w_port + 6)
+            px = min(rect.right() - 20, text_end_x + 6)
             painter.drawPixmap(px, py, pin_px)
 
     def _paint_latency(self, painter: QPainter, rect: QRect, node: ProxyNode, enabled: bool) -> None:
-        if not enabled or node.latency_ms is None:
+        state = getattr(node, "probe_state", "") if enabled else ""
+        if state == "testing":
+            label = "测速中..."
+            bg_hex, fg_hex, dot_hex = "#EFF6FF", "#2563EB", "#3B82F6"
+        elif state == "queued":
+            label = "排队中"
+            bg_hex, fg_hex, dot_hex = "#F1F5F9", "#64748B", "#94A3B8"
+        elif not enabled or node.latency_ms is None:
             painter.setFont(self.font_mono)
             painter.setPen(QColor("#CBD5E1"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "--")
             return
-
-        lat = node.latency_ms
-        if lat < 0:
-            label = node.last_error or "超时"
-            if len(label) > 6:
-                label = label[:6]
-            bg_hex, fg_hex, dot_hex = "#FEF2F2", "#DC2626", "#EF4444"
-        elif lat < 180:
-            label = f"{lat} ms"
-            bg_hex, fg_hex, dot_hex = "#ECFDF5", "#047857", "#10B981"
-        elif lat <= 450:
-            label = f"{lat} ms"
-            bg_hex, fg_hex, dot_hex = "#FFFBEB", "#B45309", "#F59E0B"
         else:
-            label = f"{lat} ms"
-            bg_hex, fg_hex, dot_hex = "#FFF1F2", "#BE123C", "#F43F5E"
+            lat = node.latency_ms
+            if lat < 0:
+                label = node.last_error or "超时"
+                bg_hex, fg_hex, dot_hex = "#FEF2F2", "#DC2626", "#EF4444"
+            elif lat < 180:
+                label = f"{lat} ms"
+                bg_hex, fg_hex, dot_hex = "#ECFDF5", "#047857", "#10B981"
+            elif lat <= 450:
+                label = f"{lat} ms"
+                bg_hex, fg_hex, dot_hex = "#FFFBEB", "#B45309", "#F59E0B"
+            else:
+                label = f"{lat} ms"
+                bg_hex, fg_hex, dot_hex = "#FFF1F2", "#BE123C", "#F43F5E"
 
         painter.setFont(self.font_badge)
         fm = QFontMetrics(self.font_badge)
-        pw = min(rect.width() - 12, fm.horizontalAdvance(label) + 24)
+        max_pill_w = max(36, rect.width() - 12)
+        max_text_w = max(12, max_pill_w - 24)
+        display_label = fm.elidedText(label, Qt.TextElideMode.ElideRight, max_text_w)
+        pw = min(max_pill_w, fm.horizontalAdvance(display_label) + 24)
         ph = 22
         px = rect.x() + (rect.width() - pw) / 2.0
         py = rect.y() + (rect.height() - ph) / 2.0
@@ -684,7 +728,7 @@ class NodeTableDelegate(QStyledItemDelegate):
 
         painter.setPen(QColor(fg_hex))
         text_r = QRectF(px + 15, py, pw - 19, ph)
-        painter.drawText(text_r, Qt.AlignmentFlag.AlignCenter, label)
+        painter.drawText(text_r, Qt.AlignmentFlag.AlignCenter, display_label)
 
 
 class RoundedMenu(QMenu):
@@ -929,19 +973,22 @@ class PasteImportDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
 
-        hint = QLabel("支持直接粘贴 Base64 订阅密文、Clash YAML 配置或多行节点分享链接 (vless/vmess/trojan/ss/socks)：")
+        hint = QLabel("支持直接粘贴 Base64 订阅密文、Clash YAML 配置或多行节点分享链接 (vless/vmess/trojan/ss/socks/hysteria2)：")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #475569; font-size: 12px;")
         layout.addWidget(hint)
 
         self.editor = QPlainTextEdit()
-        self.editor.setPlaceholderText("vless://...\ntrojan://...\n或粘贴完整 Clash proxies 配置...")
+        self.editor.setPlaceholderText("vless://...\nhysteria2://...\n或粘贴完整 Clash proxies 配置...")
         self.editor.setFont(_crisp_font("Consolas", 9.0))
         self.editor.setStyleSheet('QPlainTextEdit { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 9pt; }')
         layout.addWidget(self.editor, 1)
 
         cb_text = QApplication.clipboard().text().strip()
-        if any(s in cb_text.lower() for s in ("vmess://", "vless://", "trojan://", "ss://", "socks", "proxies:")):
+        if any(
+            s in cb_text.lower()
+            for s in ("vmess://", "vless://", "trojan://", "ss://", "socks", "hysteria2://", "hy2://", "proxies:")
+        ):
             self.editor.setPlainText(cb_text)
 
         btn_row = QHBoxLayout()
@@ -1028,9 +1075,14 @@ class ProxySettingsDialog(QDialog):
         return enabled, u, p, t_url
 
     def accept(self) -> None:
-        enabled, user, password, _ = self.get_values()
+        enabled, user, password, test_url = self.get_values()
         if enabled and (not user or not password):
             QMessageBox.warning(self, "鉴权配置不完整", "启用鉴权时，请同时填写用户名和密码。")
             (self.inp_user if not user else self.inp_pass).setFocus()
+            return
+        parsed = urlparse(test_url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            QMessageBox.warning(self, "测速地址无效", "HTTPS 测速地址必须以 http:// 或 https:// 开头并包含有效主机名。")
+            self.inp_test_url.setFocus()
             return
         super().accept()
